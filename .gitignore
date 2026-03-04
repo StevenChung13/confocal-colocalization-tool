@@ -30,7 +30,9 @@ env/
 .Trashes
 
 # IDEs
-.vscode/
+.vscode/*
+!.vscode/
+!.vscode/settings.json
 .idea/
 *.sublime-project
 *.sublime-workspace

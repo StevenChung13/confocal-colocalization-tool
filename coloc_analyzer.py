@@ -20,61 +20,47 @@ Workflow
 Input
 -----
 Multi-channel confocal images stored as separate single-channel TIFF files
-named with a ``_ch<N>.tif`` suffix, e.g.::
-
-    MyExperiment_s001_ch00.tif   (Cyan / first fluorophore)
-    MyExperiment_s001_ch01.tif   (Green / second fluorophore)
-    MyExperiment_s001_ch02.tif   (Magenta / third fluorophore)
-    MyExperiment_s001_ch03.tif   (Brightfield, optional)
-
-Files belonging to the same field of view must share a common prefix before
-``_ch``.  Subdirectories are scanned recursively.
+named with a ``_ch<N>.tif`` suffix, alongside their exported XML metadata.
 
 Output (per image)
 ------------------
 ``<output_dir>/<experiment_name>/<image_basename>/``
-
-* ``1_Cyan.tif``, ``2_Green.tif``, ``3_Magenta.tif``, ``4_Merge.tif``
-* ``5_Zoom.tif``  (if zoom is enabled)
-* ``6_BF.tif``    (if brightfield is enabled)
-* ``Panel_View.pdf`` / ``Panel_View.png``  -- publication-ready single-row panel
-* ``QC_Masks/``   -- Otsu threshold masks (if quantification is enabled)
-
-Output (global)
----------------
-``<output_dir>/<experiment_name>/``
-
-* ``<experiment_name>_SUMMARY_MONTAGE.pdf`` / ``.png``
-* ``<experiment_name>_QUANTIFICATION.csv``  -- Pearson R, Manders M1/M2
-
-Dependencies
-------------
-See ``requirements.txt``.
-
-License
--------
-MIT License -- see ``LICENSE``.
 """
 
 import napari
 import os
 import glob
 import numpy as np
+import re
+import xml.etree.ElementTree as ET
+
+# imagecodecs is required by tifffile to decompress LZW / Deflate (ZIP)
+# compressed TIFFs, which is the default lossless export format in Leica LAS X.
+try:
+    import imagecodecs  # noqa: F401
+except ImportError:
+    print(
+        "\nCRITICAL ERROR: 'imagecodecs' is not installed.\n"
+        "  tifffile requires this package to read LZW / Deflate-compressed\n"
+        "  TIFFs (the lossless export format used by Leica LAS X).\n"
+        "  Install it with:\n"
+        "      pip install imagecodecs\n"
+    )
+    exit(1)
 import pandas as pd
 import tifffile
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.font_manager import FontProperties
-from skimage.filters import threshold_otsu
 from skimage.transform import resize
+from skimage.measure import profile_line
 from scipy.stats import pearsonr
 import datetime
+import warnings
 
 # ================================================================
 #  DEFAULT BASE DIRECTORY
-#  Change this to match your system, or enter a custom path in
-#  the wizard prompt at runtime.
 # ================================================================
 BASE_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "Confocal_Workflow")
 
@@ -125,16 +111,16 @@ class SessionConfig:
         # 4. OPTIONAL FEATURES ----------------------------------------------
         print("\n--- EXTRA FEATURES ---")
         self.do_bf = get_user_input(
-            "Include Brightfield Panel? [y/n]", "n").lower() == 'y'
+            "Include Brightfield Panel?[y/n]", "n").lower() == 'y'
         self.do_zoom = get_user_input(
             "Include Zoom/Enlargement Panel? [y/n]", "n").lower() == 'y'
         self.zoom_mag  = 1
-        self.zoom_size = 0   # square side length in pixels
+        self.zoom_size = 0   
 
         if self.do_zoom:
             mag = int(get_user_input("   > Magnification Factor (e.g. 3)", "3"))
             self.zoom_mag  = mag
-            self.zoom_size = self.crop_w // mag   # square ROI side
+            self.zoom_size = self.crop_w // mag   
 
         # 5. CHANNEL LABELS -------------------------------------------------
         print("\n--- CHANNEL LABELS ---")
@@ -152,8 +138,6 @@ class SessionConfig:
 
         # 6. ILLUSTRATOR / PRINT SETTINGS -----------------------------------
         print("\n--- ILLUSTRATOR EXPORT SETTINGS ---")
-        # panel_w_mm: printed width of one panel column in millimetres
-        # sb_len_mm : physical length represented by the scale bar
         self.panel_w_mm  = float(get_user_input("Panel Width (mm)",        20.0))
         self.spacing_pt  = float(get_user_input("Spacing (pt)",             3.0))
         self.font_size   = float(get_user_input("Font Size (pt)",           5.0))
@@ -165,6 +149,11 @@ class SessionConfig:
             "Enable Quantification (Pearson/Manders)? [y/n]", "y").lower()
         self.do_quant = (q_resp == 'y')
 
+        # 8. INTENSITY LINE PROFILE -----------------------------------------
+        ip_resp = get_user_input(
+            "Enable Intensity Line Profile? [y/n]", "n").lower()
+        self.do_intensity_profile = (ip_resp == 'y')
+
         # --- DERIVED VALUES ------------------------------------------------
         self.aspect_ratio   = self.crop_h / self.crop_w
         self.panel_h_mm     = self.panel_w_mm * self.aspect_ratio
@@ -175,12 +164,10 @@ class SessionConfig:
 
         self.dpi            = self.crop_w / self.panel_w_inch
 
-        # Scale bar in pixel units
         self.sb_px_w   = (self.sb_len_mm / self.panel_w_mm) * self.crop_w
         self.sb_px_h   = (0.5            / self.panel_w_mm) * self.crop_w
         self.sb_margin = (1.0            / self.panel_w_mm) * self.crop_w
 
-        # Matplotlib font / PDF settings for vector output
         plt.rcParams['pdf.fonttype'] = 42
         plt.rcParams['ps.fonttype']  = 42
         plt.rcParams['font.family']  = 'Arial'
@@ -190,23 +177,19 @@ class SessionConfig:
         self.font_prop.set_size(self.font_size)
         self.font_prop.set_weight('bold')
 
-        # Pseudocolour mixing constants (RGB)
         self.MIX_CYAN    = np.array([0.0, 1.0, 1.0])
         self.MIX_GREEN   = np.array([0.0, 1.0, 0.0])
         self.MIX_MAGENTA = np.array([1.0, 0.0, 1.0])
 
-        # Zoom upscale: zoom_size * zoom_mag == crop_w  (square)
         self.zoom_upscaled_size = self.crop_w if self.do_zoom else 0
-        # Physical width of the zoom panel = panel height  (square in print)
         self.zoom_panel_w_inch  = self.panel_h_inch if self.do_zoom else 0
 
-        # --- SUMMARY -------------------------------------------------------
         print("\n>>> CONFIGURATION COMPLETE")
         if self.do_zoom:
-            print(f"    Zoom ROI    : {self.zoom_size}x{self.zoom_size}px (square) -> "
-                  f"{self.zoom_upscaled_size}x{self.zoom_upscaled_size}px "
-                  f"after {self.zoom_mag}x bicubic upscale")
-            print(f"    Zoom panel  : {self.panel_h_mm:.1f}x{self.panel_h_mm:.1f} mm "
+            print(f"    Zoom ROI    : {self.zoom_size}×{self.zoom_size}px (square) → "
+                  f"{self.zoom_upscaled_size}×{self.zoom_upscaled_size}px "
+                  f"after {self.zoom_mag}× bicubic upscale")
+            print(f"    Zoom panel  : {self.panel_h_mm:.1f}×{self.panel_h_mm:.1f} mm "
                   f"(square, fits row height)")
 
         print("\n" + "="*50)
@@ -215,104 +198,169 @@ class SessionConfig:
         print("  1. Drag the YELLOW box to your region of interest")
         print("  2. (If zoom enabled) Drag the CYAN box to the")
         print("     sub-region you want enlarged")
-        print("  3. Press  [c]  ->  Crop, save & advance to next image")
-        print("  4. Press  [s]  ->  Skip this image & advance")
-        print("  5. After the last image, montage + CSV are auto-saved")
+        if self.do_intensity_profile:
+            print("  3. Drag the WHITE line for intensity profiling")
+            print("  4. Press  [c]  →  Crop, save & advance to next image")
+            print("  5. Press  [s]  →  Skip this image & advance")
+            print("  6. After the last image, montage + CSV are auto-saved")
+        else:
+            print("  3. Press  [c]  →  Crop, save & advance to next image")
+            print("  4. Press  [s]  →  Skip this image & advance")
+            print("  5. After the last image, montage + CSV are auto-saved")
         print("="*50 + "\n")
 
 
 # ================================================================
-#  RGB CHANNEL DETECTOR
+#  XML METADATA DETECTOR
 # ================================================================
-class RGBDetector:
-    """Classify a single-channel TIFF into a fluorophore role based on its
-    RGB colour statistics (works with false-colour TIFF exports from most
-    confocal acquisition software).
-
-    Returns one of: ``'cyan'``, ``'green'``, ``'mag'``, ``'bf'``,
-    ``'empty'``, ``'unknown'``, or ``'error'``.
+class XMLMetadataDetector:
+    """Parses Leica LAS X exported XML metadata to map channel indices to roles.
+    Requires _chXX.tif nomenclature and a corresponding .xml file.
     """
+    def __init__(self):
+        # Strict mapping of Leica LUT naming conventions to script roles
+        self.lut_map = {
+            'cyan':    'cyan',
+            'blue':    'cyan',   # Sometimes CFP/Cyan is exported as Blue LUT
+            'green':   'green',
+            'magenta': 'mag',
+            'red':     'mag',    # mCherry/TRITC often exported as Red LUT
+            'gray':    'bf',
+            'grey':    'bf'
+        }
 
-    def detect(self, path):
-        try:
-            img = tifffile.imread(path)
-            if img.ndim != 3:
-                return "unknown"
-            # Normalise to channel-last (HxWx3)
-            if img.shape[0] == 3:
-                img = np.moveaxis(img, 0, -1)
+    def assign_roles(self, files):
+        """Map a list of TIF files to their respective roles using Leica XML."""
+        result = {'cyan': None, 'green': None, 'mag': None, 'bf': None}
+        
+        for tif_path in files:
+            base_dir = os.path.dirname(tif_path)
+            filename = os.path.basename(tif_path)
+            
+            # Extract base name and channel index
+            match = re.search(r'(.*)_ch(\d+)\.tif$', filename, re.IGNORECASE)
+            if not match:
+                continue
+                
+            base_name = match.group(1)
+            ch_idx    = int(match.group(2))
+            
+            # Locate the corresponding XML file
+            xml_candidates =[
+                os.path.join(base_dir, f"{base_name}_Properties.xml"),
+                os.path.join(base_dir, f"{base_name}.xml"),
+                os.path.join(base_dir, "MetaData", f"{base_name}_Properties.xml"),
+                os.path.join(base_dir, "MetaData", f"{base_name}.xml")
+            ]
+            
+            xml_path = next((p for p in xml_candidates if os.path.exists(p)), None)
+            
+            if not xml_path:
+                print(f"   >> WARNING: No XML metadata found for {filename}.")
+                continue
+                
+            # Parse XML and map LUT
+            try:
+                tree = ET.parse(xml_path)
+                root = tree.getroot()
+                
+                channels_node = root.find('.//Channels')
+                if channels_node is None:
+                    print(f"   >> ERROR: <Channels> tag missing in {os.path.basename(xml_path)}")
+                    continue
+                    
+                channels = channels_node.findall('./ChannelDescription')
+                
+                if ch_idx >= len(channels):
+                    print(f"   >> ERROR: Index {ch_idx} exceeds XML channel count in {os.path.basename(xml_path)}.")
+                    continue
+                    
+                lut_name = channels[ch_idx].attrib.get('LUTName', '').lower()
+                role = self.lut_map.get(lut_name)
+                
+                if role in result:
+                    result[role] = tif_path
+                    print(f"   >> METADATA: Mapped {filename} (LUT: {lut_name.capitalize()}) -> {role.upper()}")
+                else:
+                    print(f"   >> UNKNOWN LUT: {filename} has unmapped LUT '{lut_name}'. Ignored.")
+                    
+            except Exception as e:
+                print(f"   >> ERROR parsing XML {xml_path}: {e}")
 
-            p99_r = np.percentile(img[..., 0], 99.5)
-            p99_g = np.percentile(img[..., 1], 99.5)
-            p99_b = np.percentile(img[..., 2], 99.5)
-
-            max_sig = max(p99_r, p99_g, p99_b)
-            if max_sig < 1.0:
-                return "empty"
-
-            total = p99_r + p99_g + p99_b
-            if total == 0:
-                return "empty"
-
-            r_score = p99_r / total
-            g_score = p99_g / total
-            b_score = p99_b / total
-
-            # Brightfield: roughly equal R/G/B
-            if (abs(r_score - g_score) < 0.2 and
-                    abs(g_score - b_score) < 0.2):
-                return "bf"
-            if g_score > 0.45:
-                return "green"
-            if r_score > 0.3 and b_score > 0.3:
-                return "mag"
-            if r_score > 0.7:
-                return "mag"
-            if g_score > 0.3 and b_score > 0.3:
-                return "cyan"
-            return "unknown"
-
-        except Exception:
-            return "error"
+        return result
 
 
 # ================================================================
 #  COLOCALIZATION QUANTIFIER
 # ================================================================
+def _threshold_max_entropy(image):
+    """Kapur Maximum-Entropy thresholding (Kapur et al., 1985).
+
+    Selects the threshold that maximises the sum of foreground and
+    background entropy, making it more sensitive to sparse puncta
+    than Otsu's bimodal assumption.
+    """
+    # Build normalised 256-bin histogram
+    hist, bin_edges = np.histogram(image.ravel(), bins=256, density=False)
+    hist = hist.astype(np.float64)
+    hist = hist / hist.sum()          # probability distribution
+
+    # Cumulative sums
+    cum_sum = np.cumsum(hist)
+    # Avoid log(0)
+    eps = np.finfo(np.float64).eps
+
+    best_t   = 0
+    best_ent = -np.inf
+
+    for t in range(1, 256):
+        # Background probability
+        p_bg = cum_sum[t - 1]
+        if p_bg < eps or p_bg > 1.0 - eps:
+            continue
+        p_fg = 1.0 - p_bg
+
+        # Background entropy
+        h_bg = hist[:t]
+        h_bg = h_bg[h_bg > eps]
+        ent_bg = -np.sum((h_bg / p_bg) * np.log(h_bg / p_bg))
+
+        # Foreground entropy
+        h_fg = hist[t:]
+        h_fg = h_fg[h_fg > eps]
+        ent_fg = -np.sum((h_fg / p_fg) * np.log(h_fg / p_fg))
+
+        total_ent = ent_bg + ent_fg
+        if total_ent > best_ent:
+            best_ent = total_ent
+            best_t   = t
+
+    # Map bin index back to intensity value
+    return (bin_edges[best_t] + bin_edges[best_t + 1]) / 2.0
+
+
 class Quantifier:
     """Compute Pearson's R and Manders' coefficients (M1 / M2) for a
-    pair of normalised single-channel arrays.
-
-    Both input arrays should be normalised to [0, 1] before calling
-    :meth:`analyze`.
-    """
+    pair of normalised single-channel arrays."""
 
     @staticmethod
     def analyze(name, green_crop, mag_crop):
-        """
-        Parameters
-        ----------
-        name : str
-            Image identifier (used as ``Image_ID`` in the output dict).
-        green_crop, mag_crop : ndarray
-            2-D float arrays normalised to [0, 1].
-
-        Returns
-        -------
-        stats : dict or None
-        mask_g : ndarray[bool] or None   -- Otsu mask for *green*
-        mask_m : ndarray[bool] or None   -- Otsu mask for *magenta*
-        """
         flat_g = green_crop.flatten()
         flat_m = mag_crop.flatten()
         if len(flat_g) < 2:
             return None, None, None
 
-        pearson_r, _ = pearsonr(flat_g, flat_m)
+        if np.std(flat_g) == 0 or np.std(flat_m) == 0:
+            print("   >> WARNING: One or both channels are constant. Pearson R set to NaN.")
+            pearson_r = float('nan')
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                pearson_r, _ = pearsonr(flat_g, flat_m)
 
         try:
-            thresh_g = threshold_otsu(green_crop)
-            thresh_m = threshold_otsu(mag_crop)
+            thresh_g = _threshold_max_entropy(green_crop)
+            thresh_m = _threshold_max_entropy(mag_crop)
         except ValueError:
             thresh_g = 0.01
             thresh_m = 0.01
@@ -347,9 +395,10 @@ class ColocManager:
 
     def __init__(self):
         self.cfg       = SessionConfig()
-        self.detector  = RGBDetector()
-        self.gallery   = []
-        self.stats_log = []
+        # Initialize the new metadata detector
+        self.detector  = XMLMetadataDetector()
+        self.gallery   =[]
+        self.stats_log =[]
 
         self.experiments = self.scan_directory()
         if not self.experiments:
@@ -360,6 +409,7 @@ class ColocManager:
         self.viewer            = napari.Viewer()
         self.shapes_layer      = None
         self.zoom_shapes_layer = None
+        self.line_shapes_layer = None
 
         print(f"Found {len(self.experiments)} experiment sets.")
         print("   Keys:  [c] = Crop & Next  |  [s] = Skip\n")
@@ -369,18 +419,20 @@ class ColocManager:
         self.load_current_set()
         napari.run()
 
+        # Runs after the Napari window closes (Qt event loop finished)
+        self._relabel_loop()
+
     # ------------------------------------------------------------------
     #  Directory scanning
     # ------------------------------------------------------------------
     def scan_directory(self):
-        """Return a sorted list of unique base paths (everything before '_ch')."""
         search_pattern = os.path.join(self.cfg.input_dir, "**", "*.tif")
         all_tifs       = glob.glob(search_pattern, recursive=True)
         unique_bases   = set()
 
         for f in all_tifs:
             if os.path.basename(f).startswith("._"):
-                continue   # skip macOS resource forks
+                continue   
             if "_ch" in f:
                 base = f.split("_ch")[0]
                 unique_bases.add(base)
@@ -391,10 +443,12 @@ class ColocManager:
     #  Image loading helpers
     # ------------------------------------------------------------------
     def load_flat(self, path):
-        """Read a TIFF and collapse to a 2-D (HxW) float array via max projection."""
         if not path or not os.path.exists(path):
             return None
         raw = tifffile.imread(path)
+        raw = np.squeeze(raw)
+        while raw.ndim > 3:
+            raw = np.max(raw, axis=0)
         if raw.ndim == 2:
             return raw
         if raw.ndim == 3:
@@ -404,7 +458,6 @@ class ColocManager:
         return raw
 
     def auto_contrast(self, img):
-        """Stretch contrast to the 0.1-99.9 percentile range -> [0, 1]."""
         if img is None or img.size == 0:
             return None
         vmin, vmax = np.percentile(img, 0.1), np.percentile(img, 99.9)
@@ -413,7 +466,6 @@ class ColocManager:
         return np.clip((img.astype(float) - vmin) / (vmax - vmin), 0, 1)
 
     def make_rgb(self, norm, color_mix):
-        """Multiply a greyscale [0, 1] image by an RGB colour triplet."""
         if norm is None:
             return None
         return norm[..., np.newaxis] * color_mix
@@ -422,7 +474,6 @@ class ColocManager:
     #  Napari shapes helpers
     # ------------------------------------------------------------------
     def add_default_boxes(self):
-        """Place the yellow crop box (and optional cyan zoom box) at image centre."""
         h, w = 1024, 1024
         for layer in self.viewer.layers:
             if isinstance(layer, napari.layers.Image) and layer.data.ndim >= 2:
@@ -433,33 +484,65 @@ class ColocManager:
         rh, rw = self.cfg.crop_h // 2, self.cfg.crop_w // 2
 
         self.shapes_layer.data = [
-            np.array([[cy-rh, cx-rw], [cy-rh, cx+rw],
-                      [cy+rh, cx+rw], [cy+rh, cx-rw]])
+            np.array([[cy-rh, cx-rw], [cy-rh, cx+rw],[cy+rh, cx+rw], [cy+rh, cx-rw]])
         ]
         self.shapes_layer.mode = 'select'
 
         if self.cfg.do_zoom and self.zoom_shapes_layer:
-            zh = self.cfg.zoom_size // 2   # square half-side
+            zh = self.cfg.zoom_size // 2  
             self.zoom_shapes_layer.data = [
                 np.array([[cy-zh, cx-zh], [cy-zh, cx+zh],
                           [cy+zh, cx+zh], [cy+zh, cx-zh]])
             ]
             self.zoom_shapes_layer.mode = 'select'
 
+        if self.cfg.do_intensity_profile and self.line_shapes_layer is not None:
+            self.line_shapes_layer.data = [
+                np.array([[cy, cx - rw], [cy, cx + rw]])
+            ]
+            self.line_shapes_layer.mode = 'select'
+
         self.viewer.layers.selection.active = self.shapes_layer
 
     def get_box_center(self, shape_data):
-        """Return (y_centre, x_centre) of a quadrilateral shape."""
         y_vals = [p[0] for p in shape_data]
-        x_vals = [p[1] for p in shape_data]
+        x_vals =[p[1] for p in shape_data]
         return (int((min(y_vals) + max(y_vals)) / 2),
                 int((min(x_vals) + max(x_vals)) / 2))
+
+    # ------------------------------------------------------------------
+    #  Shape-layer sanitiser – prevent cross-layer drawing accidents
+    # ------------------------------------------------------------------
+    def _sanitize_shapes_layers(self):
+        """Remove shapes that were accidentally drawn in the wrong layer.
+
+        Rules
+        -----
+        * 1_MAIN_CROP  / 2_ZOOM_ROI  – only keep shapes with 4 vertices
+          (rectangles).  Any 2-vertex lines are removed.
+        * 3_LINE_PROFILE – only keep shapes with exactly 2 vertices
+          (lines).  Any 4-vertex rectangles are removed.
+        """
+        def _filter(layer, keep_npts):
+            if layer is None or len(layer.data) == 0:
+                return
+            cleaned = [s for s in layer.data if len(s) == keep_npts]
+            removed = len(layer.data) - len(cleaned)
+            if removed > 0:
+                print(f"   >> WARNING: Removed {removed} stray shape(s) "
+                      f"from '{layer.name}' (wrong vertex count).")
+                layer.data = cleaned if cleaned else layer.data[:0]
+
+        _filter(self.shapes_layer, 4)
+        if self.cfg.do_zoom:
+            _filter(self.zoom_shapes_layer, 4)
+        if self.cfg.do_intensity_profile:
+            _filter(self.line_shapes_layer, 2)
 
     # ------------------------------------------------------------------
     #  Image loading into Napari
     # ------------------------------------------------------------------
     def load_current_set(self):
-        """Load the next experiment set into the Napari viewer."""
         if self.index >= len(self.experiments):
             print(">> ALL DATASETS PROCESSED.")
             self.finalize_analysis()
@@ -469,22 +552,15 @@ class ColocManager:
         self.current_name      = os.path.basename(self.current_base_path)
 
         files     = sorted(glob.glob(f"{self.current_base_path}_ch*.tif"))
-        self.map  = {'cyan': None, 'green': None, 'mag': None, 'bf': None}
 
         print(f"\n[{self.index+1}/{len(self.experiments)}] {self.current_name}")
 
-        for f in files:
-            role = self.detector.detect(f)
-            if role in self.map and self.map[role] is None:
-                self.map[role] = f
-
+        self.map  = self.detector.assign_roles(files)
         self.mode = "TRIPLE" if self.map['cyan'] else "DUAL"
 
-        # Clear previous layers
         self.viewer.layers.select_all()
         self.viewer.layers.remove_selected()
 
-        # Add image layers
         if self.map['cyan']:
             self.viewer.add_image(self.load_flat(self.map['cyan']),
                 name='Cyan_Ch',  colormap='cyan',     blending='additive')
@@ -499,7 +575,6 @@ class ColocManager:
                 name='BF_Ch',    colormap='gray',
                 blending='translucent', opacity=0.4)
 
-        # Add shapes layers
         self.shapes_layer = self.viewer.add_shapes(
             name='1_MAIN_CROP',
             edge_color='yellow', face_color='transparent', edge_width=3)
@@ -507,6 +582,11 @@ class ColocManager:
             self.zoom_shapes_layer = self.viewer.add_shapes(
                 name='2_ZOOM_ROI',
                 edge_color='cyan', face_color='transparent', edge_width=2)
+        if self.cfg.do_intensity_profile:
+            self.line_shapes_layer = self.viewer.add_shapes(
+                name='3_LINE_PROFILE',
+                shape_type='line',
+                edge_color='white', face_color='transparent', edge_width=2)
 
         self.add_default_boxes()
 
@@ -514,13 +594,11 @@ class ColocManager:
     #  Key-binding callbacks
     # ------------------------------------------------------------------
     def skip_and_next(self, viewer):
-        """[s] Skip the current image and move to the next."""
         print(f"   >> Skipping {self.current_name}...")
         self.index += 1
         self.load_current_set()
 
     def process_and_next(self, viewer):
-        """[c] Crop the current image, run analysis, save outputs, and advance."""
         if self.shapes_layer is None or len(self.shapes_layer.data) == 0:
             print("   >> No crop box found!")
             return
@@ -551,7 +629,6 @@ class ColocManager:
                     return np.zeros((h, w), dtype=np.float32)
                 return arr.astype(np.float32)
 
-            # --- QUANTIFICATION -------------------------------------------
             mask_g = mask_m = None
             if self.cfg.do_quant:
                 def norm_for_stats(arr):
@@ -569,7 +646,6 @@ class ColocManager:
             else:
                 print("   >> Visuals only")
 
-            # --- DISPLAY NORMALISATION ------------------------------------
             norm_c  = ensure_shape(self.auto_contrast(raw_crop_c))
             norm_g  = ensure_shape(self.auto_contrast(raw_crop_g))
             norm_m  = ensure_shape(self.auto_contrast(raw_crop_m))
@@ -581,7 +657,6 @@ class ColocManager:
             merge_rgb = np.clip(c_rgb + g_rgb + m_rgb, 0, 1)
             bf_rgb    = np.stack((norm_bf,)*3, axis=-1)
 
-            # --- ZOOM PANEL -----------------------------------------------
             zoom_rgb            = None
             zoom_coords_in_main = None
 
@@ -589,11 +664,11 @@ class ColocManager:
                     and len(self.zoom_shapes_layer.data) > 0):
 
                 zyc, zxc = self.get_box_center(self.zoom_shapes_layer.data[-1])
-                zs       = self.cfg.zoom_size    # square side
+                zs       = self.cfg.zoom_size    
                 zh       = zs // 2
                 zy1, zy2 = zyc - zh, zyc + zh
                 zx1, zx2 = zxc - zh, zxc + zh
-                target_px = self.cfg.zoom_upscaled_size  # = crop_w
+                target_px = self.cfg.zoom_upscaled_size  
 
                 def zoom_crop_upscale_contrast(img_data):
                     crop = self.safe_crop(img_data, zy1, zy2, zx1, zx2)
@@ -614,14 +689,62 @@ class ColocManager:
                 zoom_rgb            = np.clip(z_rgb, 0, 1)
                 zoom_coords_in_main = (zy1 - y1, zx1 - x1)
 
-                print(f"   >> ZOOM: {zs}x{zs} -> {target_px}x{target_px} "
-                      f"({self.cfg.zoom_mag}x bicubic upscale)")
+                print(f"   >> ZOOM: {zs}×{zs} → {target_px}×{target_px} "
+                      f"({self.cfg.zoom_mag}× bicubic upscale)")
 
-            # --- SAVE -----------------------------------------------------
+            # --- INTENSITY LINE PROFILE -----------------------------------
+            intensity_data   = None
+            line_coords_crop = None
+            _raw_profiles    = None
+
+            if (self.cfg.do_intensity_profile
+                    and self.line_shapes_layer is not None
+                    and len(self.line_shapes_layer.data) > 0):
+
+                # Sanitize: remove any accidental shapes from wrong layers
+                self._sanitize_shapes_layers()
+
+                line_pts = self.line_shapes_layer.data[-1]  # [[y0,x0],[y1,x1]]
+                p0 = (int(line_pts[0][0]) - y1, int(line_pts[0][1]) - x1)
+                p1 = (int(line_pts[1][0]) - y1, int(line_pts[1][1]) - x1)
+                line_coords_crop = (p0, p1)
+
+                def _profile(arr_2d):
+                    """Extract intensity along line, normalise 0-1."""
+                    prof = profile_line(arr_2d, p0, p1, order=1, mode='constant')
+                    pmin, pmax = prof.min(), prof.max()
+                    if pmax > pmin:
+                        return (prof - pmin) / (pmax - pmin)
+                    return np.zeros_like(prof)
+
+                prof_dict = {'Distance_px': np.arange(len(_profile(norm_g)))}
+                if self.mode == "TRIPLE":
+                    prof_dict[self.cfg.lbl_c] = _profile(norm_c)
+                prof_dict[self.cfg.lbl_g] = _profile(norm_g)
+                prof_dict[self.cfg.lbl_m] = _profile(norm_m)
+
+                intensity_data = pd.DataFrame(prof_dict)
+
+                # Store raw arrays for relabeling later
+                _raw_profiles = {'distance': prof_dict['Distance_px']}
+                if self.mode == "TRIPLE":
+                    _raw_profiles['cyan'] = prof_dict[self.cfg.lbl_c]
+                _raw_profiles['green'] = prof_dict[self.cfg.lbl_g]
+                _raw_profiles['mag']   = prof_dict[self.cfg.lbl_m]
+
+                # Save CSV
+                save_dir = os.path.join(self.cfg.output_dir, self.current_name)
+                os.makedirs(save_dir, exist_ok=True)
+                intensity_data.to_csv(
+                    os.path.join(save_dir, "Intensity_Profile.csv"), index=False)
+                print(f"   >> INTENSITY PROFILE saved ({len(intensity_data)} pts)")
+
             self.save_individual_and_local_panel(
                 self.current_name,
                 c_rgb, g_rgb, m_rgb, merge_rgb, bf_rgb,
-                zoom_rgb, zoom_coords_in_main, mask_g, mask_m)
+                zoom_rgb, zoom_coords_in_main, mask_g, mask_m,
+                intensity_data=intensity_data,
+                line_coords_crop=line_coords_crop)
 
             self.gallery.append({
                 'name':        self.current_name,
@@ -633,6 +756,9 @@ class ColocManager:
                 'zoom':        zoom_rgb,
                 'zoom_coords': zoom_coords_in_main,
                 'mode':        self.mode,
+                'intensity_data':  intensity_data,
+                'line_coords':     line_coords_crop,
+                'raw_profiles':    _raw_profiles if intensity_data is not None else None,
             })
 
             self.index += 1
@@ -646,7 +772,6 @@ class ColocManager:
     #  Cropping / upscaling utilities
     # ------------------------------------------------------------------
     def safe_crop(self, img, y1, y2, x1, x2):
-        """Clip crop coordinates to image bounds and return the sub-array."""
         if img is None:
             return None
         h, w = img.shape[:2]
@@ -657,7 +782,6 @@ class ColocManager:
         return img[y1:y2, x1:x2]
 
     def upscale_channel(self, crop, target_h, target_w):
-        """Bicubic upscale a 2-D array to (*target_h*, *target_w*)."""
         if crop is None:
             return None
         return resize(
@@ -668,24 +792,23 @@ class ColocManager:
     #  Figure layout helpers
     # ------------------------------------------------------------------
     def _col_widths_inch(self, col_labels):
-        """Return a list of column widths (inches).
-        The zoom column is square -> ``zoom_panel_w_inch``.
-        All other columns -> ``panel_w_inch``."""
-        return [self.cfg.zoom_panel_w_inch
-                if lbl == self.cfg.lbl_zoom else self.cfg.panel_w_inch
-                for lbl in col_labels]
+        widths = []
+        for lbl in col_labels:
+            if lbl == self.cfg.lbl_zoom:
+                widths.append(self.cfg.zoom_panel_w_inch)
+            else:
+                widths.append(self.cfg.panel_w_inch)
+        return widths
 
     def _make_axes_grid(self, fig, n_rows, n_cols, col_w, total_w, total_h):
-        """Create a 2-D list of axes using ``fig.add_axes`` for
-        pixel-perfect placement with per-column widths."""
         row_h = self.cfg.panel_h_inch
-        axes  = []
+        axes  =[]
         for r in range(n_rows):
             row_top = r * (row_h + self.cfg.spacing_inch)
             bottom  = 1.0 - (row_top + row_h) / total_h
             h_frac  = row_h / total_h
 
-            row_axes = []
+            row_axes =[]
             x = 0.0
             for ci in range(n_cols):
                 left   = x / total_w
@@ -696,8 +819,60 @@ class ColocManager:
             axes.append(row_axes)
         return axes
 
+    # ------------------------------------------------------------------
+    #  Intensity plot renderer (shared by individual panels & montage)
+    # ------------------------------------------------------------------
+    def _render_intensity_axes(self, ax, intensity_data, mode='DUAL',
+                                linewidth=0.8, tick_scale=1.0):
+        """Draw channel intensity traces on *ax*. Transparent background,
+        only left & bottom spines, no x-tick labels, plot fills full panel."""
+        ax.set_facecolor('none')  # transparent background
+        ax.patch.set_alpha(0)
+
+        dist = intensity_data['Distance_px'].values
+        if mode == "TRIPLE" and self.cfg.lbl_c in intensity_data:
+            ax.plot(dist, intensity_data[self.cfg.lbl_c].values,
+                    color='cyan', linewidth=linewidth)
+        if self.cfg.lbl_g in intensity_data:
+            ax.plot(dist, intensity_data[self.cfg.lbl_g].values,
+                    color='lime', linewidth=linewidth)
+        if self.cfg.lbl_m in intensity_data:
+            ax.plot(dist, intensity_data[self.cfg.lbl_m].values,
+                    color='magenta', linewidth=linewidth)
+
+        ax.set_xlim(dist[0], dist[-1])
+        ax.set_ylim(0, 1.05)
+
+        # Remove top & right spines
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_edgecolor('black')
+        ax.spines['left'].set_linewidth(0.5 * tick_scale)
+        ax.spines['bottom'].set_edgecolor('black')
+        ax.spines['bottom'].set_linewidth(0.5 * tick_scale)
+
+        ts = self.cfg.font_size * 0.7 * tick_scale
+        # Y-axis: keep tick labels.  X-axis: ticks but no labels.
+        ax.tick_params(axis='y', colors='black', labelsize=ts,
+                       length=2 * tick_scale, pad=1)
+        ax.tick_params(axis='x', colors='black', labelsize=ts,
+                       length=2 * tick_scale, pad=1,
+                       labelbottom=False)  # hide x-axis numbers
+        ax.yaxis.set_label_position('left')
+        ax.yaxis.tick_left()
+
+        # Adjust position: small left margin for y-tick labels,
+        # then let the plot area fill the rest of the panel.
+        pos = ax.get_position()
+        left_margin = pos.width * 0.10   # space for y-axis ticks
+        ax.set_position([
+            pos.x0 + left_margin,
+            pos.y0,
+            pos.width - left_margin,
+            pos.height,
+        ])
+
     def add_scale_bar_patch(self, ax):
-        """Draw a white filled rectangle as a scale bar on *ax*."""
         x_start = self.cfg.crop_w - self.cfg.sb_px_w - self.cfg.sb_margin
         y_start = self.cfg.crop_h - self.cfg.sb_margin - self.cfg.sb_px_h
         ax.add_patch(patches.Rectangle(
@@ -708,16 +883,15 @@ class ColocManager:
     #  Output saving
     # ------------------------------------------------------------------
     def save_individual_and_local_panel(self, name, c, g, m, merge, bf,
-                                        zoom, zoom_coords, mask_g, mask_m):
-        """Save individual channel TIFFs, QC masks, and a panel PDF/PNG
-        for a single cropped field of view."""
+                                        zoom, zoom_coords, mask_g, mask_m,
+                                        intensity_data=None,
+                                        line_coords_crop=None):
         save_path = os.path.join(self.cfg.output_dir, name)
         os.makedirs(save_path, exist_ok=True)
 
         def to_uint8(arr):
             return (arr * 255).astype(np.uint8)
 
-        # Individual TIFFs
         if self.mode == "TRIPLE":
             tifffile.imwrite(os.path.join(save_path, "1_Cyan.tif"),    to_uint8(c))
         tifffile.imwrite(os.path.join(save_path, "2_Green.tif"),       to_uint8(g))
@@ -728,7 +902,6 @@ class ColocManager:
         if self.cfg.do_bf:
             tifffile.imwrite(os.path.join(save_path, "6_BF.tif"),      to_uint8(bf))
 
-        # QC Otsu masks
         if mask_g is not None and mask_m is not None:
             qc_path = os.path.join(save_path, "QC_Masks")
             os.makedirs(qc_path, exist_ok=True)
@@ -737,8 +910,7 @@ class ColocManager:
             tifffile.imwrite(
                 os.path.join(qc_path, "Mask_Mag_Otsu.tif"),   to_uint8(mask_m))
 
-        # Build panel plot list (BF always last)
-        plot_list = []
+        plot_list =[]
         if self.mode == "TRIPLE":
             plot_list.append((c,     self.cfg.lbl_c))
         plot_list.append((g,         self.cfg.lbl_g))
@@ -748,6 +920,11 @@ class ColocManager:
             plot_list.append((zoom,  self.cfg.lbl_zoom))
         if self.cfg.do_bf:
             plot_list.append((bf,    self.cfg.lbl_bf))
+
+        # Append intensity profile as the rightmost panel
+        has_profile = (intensity_data is not None and not intensity_data.empty)
+        if has_profile:
+            plot_list.append((None, '__intensity__'))  # sentinel
 
         n_cols     = len(plot_list)
         col_labels = [lbl for _, lbl in plot_list]
@@ -762,6 +939,14 @@ class ColocManager:
 
         for i, ax in enumerate(axes):
             img_data, label = plot_list[i]
+
+            # --- Intensity profile panel (rightmost) -----------------------
+            if label == '__intensity__':
+                self._render_intensity_axes(ax, intensity_data, mode=self.mode,
+                                            linewidth=0.8, tick_scale=1.0)
+                continue
+
+            # --- Normal image panel ----------------------------------------
             ax.imshow(img_data, aspect='auto')
             ax.axis('off')
             ax.text(0.05, 0.95, label, transform=ax.transAxes, color='white',
@@ -769,13 +954,19 @@ class ColocManager:
             if i == 0:
                 self.add_scale_bar_patch(ax)
 
-            # Dashed outline on the merge panel showing the zoom ROI
-            if label == self.cfg.lbl_merge and zoom_coords is not None:
-                ry, rx = zoom_coords
-                ax.add_patch(patches.Rectangle(
-                    (rx, ry), self.cfg.zoom_size, self.cfg.zoom_size,
-                    linewidth=1, edgecolor='white',
-                    facecolor='none', linestyle='--'))
+            if label == self.cfg.lbl_merge:
+                # Draw zoom ROI rectangle
+                if zoom_coords is not None:
+                    ry, rx = zoom_coords
+                    ax.add_patch(patches.Rectangle(
+                        (rx, ry), self.cfg.zoom_size, self.cfg.zoom_size,
+                        linewidth=1, edgecolor='white',
+                        facecolor='none', linestyle='--'))
+                # Draw intensity line
+                if line_coords_crop is not None:
+                    (ly0, lx0), (ly1, lx1) = line_coords_crop
+                    ax.plot([lx0, lx1], [ly0, ly1],
+                            color='white', linewidth=0.8, linestyle='--')
 
         plt.savefig(os.path.join(save_path, "Panel_View.pdf"), dpi=self.cfg.dpi)
         plt.savefig(os.path.join(save_path, "Panel_View.png"), dpi=self.cfg.dpi)
@@ -785,7 +976,6 @@ class ColocManager:
     #  Finalisation
     # ------------------------------------------------------------------
     def finalize_analysis(self):
-        """Called after the last image is processed: build montage and save CSV."""
         if self.gallery:
             self.build_global_montage()
 
@@ -797,18 +987,101 @@ class ColocManager:
             print(f">> STATS SAVED: {csv_path}")
 
     # ------------------------------------------------------------------
+    #  Post-processing relabeling
+    # ------------------------------------------------------------------
+    def _relabel_loop(self):
+        """Allow the user to change channel labels and regenerate all figures."""
+        while True:
+            resp = get_user_input(
+                "\nWould you like to relabel channels? [y/n]", "n").lower()
+            if resp != 'y':
+                print(">> No relabeling requested. Done.")
+                break
+
+            print("\n--- RELABEL CHANNELS ---")
+            print("   (Press Enter to keep the current label)")
+            self.cfg.lbl_c     = get_user_input(
+                f"Cyan Label",    self.cfg.lbl_c)
+            self.cfg.lbl_g     = get_user_input(
+                f"Green Label",   self.cfg.lbl_g)
+            self.cfg.lbl_m     = get_user_input(
+                f"Magenta Label", self.cfg.lbl_m)
+            self.cfg.lbl_merge = get_user_input(
+                f"Merge Label",   self.cfg.lbl_merge)
+            if self.cfg.do_zoom:
+                self.cfg.lbl_zoom = get_user_input(
+                    f"Enlargement Label", self.cfg.lbl_zoom)
+            if self.cfg.do_bf:
+                self.cfg.lbl_bf = get_user_input(
+                    f"Brightfield Label", self.cfg.lbl_bf)
+
+            # Re-save CSV with updated column headers first (updates DataFrames)
+            self._regenerate_intensity_csvs()
+
+            print("\n>>> Regenerating all panel views with new labels...")
+            self._regenerate_all_panels()
+
+            print(">>> Regenerating summary montage with new labels...")
+            if self.gallery:
+                self.build_global_montage()
+
+            print(">>> Relabeling complete.")
+
+    def _regenerate_all_panels(self):
+        """Re-draw and overwrite every individual Panel_View using current labels."""
+        for item in self.gallery:
+            name = item['name']
+            self.mode = item['mode']  # restore per-image mode for panel logic
+            self.save_individual_and_local_panel(
+                name,
+                item['cyan'],
+                item['green'],
+                item['mag'],
+                item['merge'],
+                item.get('bf'),
+                item.get('zoom'),
+                item.get('zoom_coords'),
+                None, None,  # mask_g, mask_m – TIFFs already saved
+                intensity_data=item.get('intensity_data'),
+                line_coords_crop=item.get('line_coords'),
+            )
+        print(f"   >> {len(self.gallery)} panel view(s) regenerated.")
+
+    def _regenerate_intensity_csvs(self):
+        """Re-save intensity CSVs so column headers reflect new labels."""
+        for item in self.gallery:
+            raw = item.get('raw_profiles')
+            if raw is None:
+                continue
+            # Rebuild DataFrame with current label names
+            new_dict = {'Distance_px': raw['distance']}
+            if 'cyan' in raw:
+                new_dict[self.cfg.lbl_c] = raw['cyan']
+            new_dict[self.cfg.lbl_g] = raw['green']
+            new_dict[self.cfg.lbl_m] = raw['mag']
+            new_df = pd.DataFrame(new_dict)
+            # Update the stored intensity_data so panel regen uses new labels
+            item['intensity_data'] = new_df
+            save_dir = os.path.join(self.cfg.output_dir, item['name'])
+            new_df.to_csv(
+                os.path.join(save_dir, "Intensity_Profile.csv"), index=False)
+        if any(item.get('raw_profiles') for item in self.gallery):
+            print("   >> Intensity CSVs updated with new labels.")
+
+    # ------------------------------------------------------------------
     #  Summary Montage
     # ------------------------------------------------------------------
     def build_global_montage(self):
-        """Assemble all cropped panels into a single summary montage (PDF + PNG)."""
         print("\n>>> GENERATING SUMMARY MONTAGES (PDF + PNG)...")
 
         n_rows   = len(self.gallery)
         has_cyan = any(x['mode'] == "TRIPLE"    for x in self.gallery)
         has_zoom = any(x['zoom'] is not None     for x in self.gallery)
 
-        col_keys   = []
-        col_labels = []
+        has_intensity = any(x.get('intensity_data') is not None for x in self.gallery)
+
+        col_keys   =[]
+        col_labels =[]
         if has_cyan:
             col_keys.append('cyan');  col_labels.append(self.cfg.lbl_c)
         col_keys.append('green');     col_labels.append(self.cfg.lbl_g)
@@ -818,6 +1091,8 @@ class ColocManager:
             col_keys.append('zoom');  col_labels.append(self.cfg.lbl_zoom)
         if self.cfg.do_bf:
             col_keys.append('bf');    col_labels.append(self.cfg.lbl_bf)
+        if has_intensity:
+            col_keys.append('__intensity__'); col_labels.append('__intensity__')
 
         n_cols  = len(col_keys)
         col_w   = self._col_widths_inch(col_labels)
@@ -835,7 +1110,22 @@ class ColocManager:
 
         for r, item in enumerate(self.gallery):
             for ci, key in enumerate(col_keys):
-                ax       = axes[r][ci]
+                ax = axes[r][ci]
+
+                # --- Intensity profile column --------------------------------
+                if key == '__intensity__':
+                    idata = item.get('intensity_data')
+                    if idata is not None and not idata.empty:
+                        self._render_intensity_axes(
+                            ax, idata, mode=item.get('mode', 'DUAL'),
+                            linewidth=0.5, tick_scale=0.7)
+                    else:
+                        ax.set_facecolor('none')
+                        ax.patch.set_alpha(0)
+                        ax.axis('off')
+                    continue
+
+                # --- Normal image column -------------------------------------
                 img_data = item.get(key)
                 if img_data is None:
                     img_data = black_zoom if key == 'zoom' else black_main
@@ -843,23 +1133,26 @@ class ColocManager:
                 ax.imshow(img_data, aspect='auto')
                 ax.axis('off')
 
-                # Column headers on the first row only
                 if r == 0:
                     ax.text(0.05, 0.95, col_labels[ci], transform=ax.transAxes,
                             color='white', fontproperties=self.cfg.font_prop,
                             ha='left', va='top')
 
-                # Scale bar on the top-left panel only
                 if r == 0 and ci == 0:
                     self.add_scale_bar_patch(ax)
 
-                # Dashed zoom outline on merge column
-                if key == 'merge' and item.get('zoom_coords') is not None:
-                    ry, rx = item['zoom_coords']
-                    ax.add_patch(patches.Rectangle(
-                        (rx, ry), self.cfg.zoom_size, self.cfg.zoom_size,
-                        linewidth=0.5, edgecolor='white',
-                        facecolor='none', linestyle='--'))
+                if key == 'merge':
+                    if item.get('zoom_coords') is not None:
+                        ry, rx = item['zoom_coords']
+                        ax.add_patch(patches.Rectangle(
+                            (rx, ry), self.cfg.zoom_size, self.cfg.zoom_size,
+                            linewidth=0.5, edgecolor='white',
+                            facecolor='none', linestyle='--'))
+                    # Draw intensity line on merge panel in montage
+                    if item.get('line_coords') is not None:
+                        (ly0, lx0), (ly1, lx1) = item['line_coords']
+                        ax.plot([lx0, lx1], [ly0, ly1],
+                                color='white', linewidth=0.5, linestyle='--')
 
         base_name = os.path.join(self.cfg.output_dir,
                                  f"{self.cfg.exp_name}_SUMMARY_MONTAGE")

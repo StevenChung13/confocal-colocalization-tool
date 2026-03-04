@@ -25,6 +25,21 @@ Built on [Napari](https://napari.org/), it lets you visually select regions of i
 - Python >= 3.9
 - See [`requirements.txt`](requirements.txt) for all dependencies
 
+### Recommended local setup (VS Code)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Then in VS Code:
+
+1. Run **Python: Select Interpreter**
+2. Choose `.venv/bin/python`
+3. Run **Developer: Reload Window** if `Import "napari" could not be resolved` persists
+
 Install dependencies with:
 
 ```bash
