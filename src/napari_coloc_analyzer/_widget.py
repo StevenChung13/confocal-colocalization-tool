@@ -7,6 +7,7 @@ from the standalone ``coloc_analyzer.py``.
 
 import os
 import glob
+import json
 import traceback
 
 import napari
@@ -16,7 +17,7 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox,
     QCheckBox, QPushButton, QTextEdit, QFileDialog,
-    QScrollArea, QSizePolicy,
+    QScrollArea, QSizePolicy, QProgressBar,
 )
 from qtpy.QtCore import Qt
 from skimage.measure import profile_line
@@ -51,6 +52,9 @@ _FINALIZED = "FINALIZED"
 class ColocWidget(QWidget):
     """Single dock widget that drives the full colocalization workflow."""
 
+    _SETTINGS_PATH = os.path.join(
+        os.path.expanduser("~"), ".napari_coloc_settings.json")
+
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
         self.viewer = viewer
@@ -73,6 +77,8 @@ class ColocWidget(QWidget):
         self.line_shapes_layer = None
 
         self._build_ui()
+        self._load_settings()          # (E) Restore last-used settings
+        self._bind_keyboard_shortcuts() # (D) Keyboard shortcuts
         self._set_state(_UNCONFIGURED)
 
     # ----------------------------------------------------------------
@@ -245,13 +251,28 @@ class ColocWidget(QWidget):
         self.nav_label = QLabel("No experiment loaded")
         nl.addWidget(self.nav_label)
 
+        # (B) Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%v / %m")
+        self.progress_bar.setValue(0)
+        nl.addWidget(self.progress_bar)
+
         row_btns = QHBoxLayout()
+        # (A) Go-back button
+        self.back_btn = QPushButton("\u2190 Back")
+        self.back_btn.setToolTip("Return to the previous image (undo last crop)  [B]")
+        self.back_btn.clicked.connect(self._on_go_back)
+        row_btns.addWidget(self.back_btn)
+
         self.process_btn = QPushButton("Process && Next")
         self.process_btn.setStyleSheet("font-weight: bold; padding: 6px;")
+        self.process_btn.setToolTip("Process current crop and advance  [Enter]")
         self.process_btn.clicked.connect(self._on_process_and_next)
         row_btns.addWidget(self.process_btn)
 
         self.skip_btn = QPushButton("Skip")
+        self.skip_btn.setToolTip("Skip this image without processing  [S]")
         self.skip_btn.clicked.connect(self._on_skip)
         row_btns.addWidget(self.skip_btn)
         nl.addLayout(row_btns)
@@ -267,6 +288,14 @@ class ColocWidget(QWidget):
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(160)
         ll2.addWidget(self.log_text)
+
+        # (C) Export log button
+        self.export_log_btn = QPushButton("Save Log to File")
+        self.export_log_btn.setToolTip(
+            "Export the entire status log to a .txt file in the output folder.")
+        self.export_log_btn.clicked.connect(self._on_export_log)
+        ll2.addWidget(self.export_log_btn)
+
         grp_log.setLayout(ll2)
         layout.addWidget(grp_log)
 
@@ -295,6 +324,15 @@ class ColocWidget(QWidget):
         grp_relabel.setLayout(rl)
         layout.addWidget(grp_relabel)
         self.grp_relabel = grp_relabel
+
+        # === NEW EXPERIMENT (RESET) BUTTON ===
+        self.reset_btn = QPushButton("\u21bb  NEW EXPERIMENT")
+        self.reset_btn.setStyleSheet(
+            "font-weight: bold; padding: 10px; background-color: #335577; color: white;")
+        self.reset_btn.setToolTip(
+            "Clear all layers and results, then open a new input folder.")
+        self.reset_btn.clicked.connect(self._on_reset)
+        layout.addWidget(self.reset_btn)
 
         # Finalise scroll area
         layout.addStretch()
@@ -336,8 +374,11 @@ class ColocWidget(QWidget):
 
         self.load_btn.setEnabled(is_unconfigured or is_finalized)
         self.grp_nav.setEnabled(is_viewing)
+        self.back_btn.setEnabled(is_viewing and self.index > 0)
         self.finalize_btn.setEnabled(is_finalized)
         self.grp_relabel.setEnabled(is_finalized)
+        self.reset_btn.setEnabled(is_finalized)
+        self.export_log_btn.setEnabled(is_viewing or is_finalized)
 
     # ----------------------------------------------------------------
     #  LOG HELPER
@@ -413,7 +454,13 @@ class ColocWidget(QWidget):
         self.index = 0
         self.gallery = []
         self.stats_log = []
+
+        # (B) Initialise progress bar
+        self.progress_bar.setMaximum(len(self.experiments))
+        self.progress_bar.setValue(0)
+
         self._log(f"Found {len(self.experiments)} experiment set(s).")
+        self._save_settings()          # (E) Persist settings for next launch
         self._set_state(_VIEWING)
         self._load_current_set()
 
@@ -430,6 +477,10 @@ class ColocWidget(QWidget):
         self.current_name = os.path.basename(self.current_base_path)
 
         files = sorted(glob.glob(f"{self.current_base_path}_ch*.tif"))
+
+        # (B) Update progress bar + back-button state
+        self.progress_bar.setValue(self.index)
+        self.back_btn.setEnabled(self.index > 0)
 
         self._log(f"\n[{self.index+1}/{len(self.experiments)}] {self.current_name}")
 
@@ -706,6 +757,136 @@ class ColocWidget(QWidget):
         self._load_current_set()
 
     # ----------------------------------------------------------------
+    #  (A) GO BACK / UNDO
+    # ----------------------------------------------------------------
+    def _on_go_back(self):
+        """Return to the previous image, discarding the last processed entry."""
+        if self.index <= 0:
+            self._log("   >> Already at the first image.")
+            return
+
+        # If the last gallery entry corresponds to the previous index, remove it
+        prev_base = self.experiments[self.index - 1]
+        prev_name = os.path.basename(prev_base)
+        if self.gallery and self.gallery[-1]['name'] == prev_name:
+            self.gallery.pop()
+            if self.stats_log and self.stats_log[-1].get('Image') == prev_name:
+                self.stats_log.pop()
+            self._log(f"   << Undid processing for {prev_name}")
+        else:
+            self._log(f"   << Going back to {prev_name} (was skipped)")
+
+        self.index -= 1
+        self._load_current_set()
+
+    # ----------------------------------------------------------------
+    #  (C) EXPORT LOG
+    # ----------------------------------------------------------------
+    def _on_export_log(self):
+        """Save the status log to a text file."""
+        # Determine save location
+        if self.cfg and self.cfg.output_dir:
+            default_path = os.path.join(self.cfg.output_dir, "session_log.txt")
+        else:
+            default_path = os.path.join(BASE_DIR, "session_log.txt")
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Log File", default_path, "Text files (*.txt)")
+        if not path:
+            return
+        try:
+            with open(path, 'w') as f:
+                f.write(self.log_text.toPlainText())
+            self._log(f"   >> Log exported to {path}")
+        except Exception as e:
+            self._log(f"ERROR saving log: {e}")
+
+    # ----------------------------------------------------------------
+    #  (D) KEYBOARD SHORTCUTS
+    # ----------------------------------------------------------------
+    def _bind_keyboard_shortcuts(self):
+        """Register viewer key bindings for fast navigation."""
+        @self.viewer.bind_key('Enter', overwrite=True)
+        def _key_process(viewer):
+            if self._state == _VIEWING:
+                self._on_process_and_next()
+
+        @self.viewer.bind_key('s', overwrite=True)
+        def _key_skip(viewer):
+            if self._state == _VIEWING:
+                self._on_skip()
+
+        @self.viewer.bind_key('b', overwrite=True)
+        def _key_back(viewer):
+            if self._state == _VIEWING and self.index > 0:
+                self._on_go_back()
+
+    # ----------------------------------------------------------------
+    #  (E) REMEMBER LAST SETTINGS
+    # ----------------------------------------------------------------
+    def _save_settings(self):
+        """Persist current widget values to a JSON file."""
+        data = {
+            'input_dir':    self.input_dir_edit.text(),
+            'exp_name':     self.exp_name_edit.text(),
+            'crop_w':       self.crop_w_spin.value(),
+            'crop_h':       self.crop_h_spin.value(),
+            'do_bf':        self.bf_check.isChecked(),
+            'do_zoom':      self.zoom_check.isChecked(),
+            'zoom_mag':     self.zoom_mag_spin.value(),
+            'lbl_c':        self.lbl_c_edit.text(),
+            'lbl_g':        self.lbl_g_edit.text(),
+            'lbl_m':        self.lbl_m_edit.text(),
+            'lbl_merge':    self.lbl_merge_edit.text(),
+            'lbl_zoom':     self.lbl_zoom_edit.text(),
+            'lbl_bf':       self.lbl_bf_edit.text(),
+            'do_quant':     self.quant_check.isChecked(),
+            'do_profile':   self.profile_check.isChecked(),
+            'panel_w_mm':   self.panel_w_spin.value(),
+            'spacing_pt':   self.spacing_spin.value(),
+            'font_size':    self.font_spin.value(),
+            'sb_um':        self.sb_um_spin.value(),
+            'sb_len_mm':    self.sb_spin.value(),
+        }
+        try:
+            with open(self._SETTINGS_PATH, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass   # Non-critical; silently ignore write errors
+
+    def _load_settings(self):
+        """Restore widget values from the saved JSON file, if it exists."""
+        if not os.path.isfile(self._SETTINGS_PATH):
+            return
+        try:
+            with open(self._SETTINGS_PATH) as f:
+                d = json.load(f)
+        except Exception:
+            return
+
+        # Apply values defensively (missing keys are simply skipped)
+        if d.get('input_dir'):    self.input_dir_edit.setText(d['input_dir'])
+        if d.get('exp_name'):     self.exp_name_edit.setText(d['exp_name'])
+        if 'crop_w' in d:        self.crop_w_spin.setValue(d['crop_w'])
+        if 'crop_h' in d:        self.crop_h_spin.setValue(d['crop_h'])
+        if 'do_bf' in d:         self.bf_check.setChecked(d['do_bf'])
+        if 'do_zoom' in d:       self.zoom_check.setChecked(d['do_zoom'])
+        if 'zoom_mag' in d:      self.zoom_mag_spin.setValue(d['zoom_mag'])
+        if d.get('lbl_c'):       self.lbl_c_edit.setText(d['lbl_c'])
+        if d.get('lbl_g'):       self.lbl_g_edit.setText(d['lbl_g'])
+        if d.get('lbl_m'):       self.lbl_m_edit.setText(d['lbl_m'])
+        if d.get('lbl_merge'):   self.lbl_merge_edit.setText(d['lbl_merge'])
+        if d.get('lbl_zoom'):    self.lbl_zoom_edit.setText(d['lbl_zoom'])
+        if d.get('lbl_bf'):      self.lbl_bf_edit.setText(d['lbl_bf'])
+        if 'do_quant' in d:      self.quant_check.setChecked(d['do_quant'])
+        if 'do_profile' in d:    self.profile_check.setChecked(d['do_profile'])
+        if 'panel_w_mm' in d:    self.panel_w_spin.setValue(d['panel_w_mm'])
+        if 'spacing_pt' in d:    self.spacing_spin.setValue(d['spacing_pt'])
+        if 'font_size' in d:     self.font_spin.setValue(d['font_size'])
+        if 'sb_um' in d:         self.sb_um_spin.setValue(d['sb_um'])
+        if 'sb_len_mm' in d:     self.sb_spin.setValue(d['sb_len_mm'])
+
+    # ----------------------------------------------------------------
     #  FINALIZE
     # ----------------------------------------------------------------
     def _on_finalize(self):
@@ -740,3 +921,39 @@ class ColocWidget(QWidget):
         if self.gallery:
             self.fig_builder.build_global_montage(self.gallery, log=self._log)
         self._log(">>> Relabeling complete.")
+
+    # ----------------------------------------------------------------
+    #  RESET (NEW EXPERIMENT)
+    # ----------------------------------------------------------------
+    def _on_reset(self):
+        """Clear all layers, results, and state so the user can load a
+        new input folder without restarting Napari."""
+        # 1. Remove all viewer layers
+        self.viewer.layers.select_all()
+        self.viewer.layers.remove_selected()
+
+        # 2. Reset processing state
+        self.cfg = None
+        self.fig_builder = None
+        self.experiments = []
+        self.index = 0
+        self.gallery = []
+        self.stats_log = []
+        self.current_base_path = None
+        self.current_name = None
+        self.mode = "DUAL"
+        self.shapes_layer = None
+        self.zoom_shapes_layer = None
+        self.line_shapes_layer = None
+
+        # 3. Reset pixel size (will be re-detected from new folder)
+        self.px_size_spin.setValue(0.0)
+        self._update_sb_preview()
+
+        # 4. Clear UI feedback
+        self.nav_label.setText("No experiment loaded")
+        self.log_text.clear()
+        self._log("Session reset. Ready for a new experiment folder.")
+
+        # 5. Return to unconfigured state
+        self._set_state(_UNCONFIGURED)
