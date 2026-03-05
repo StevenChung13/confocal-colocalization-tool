@@ -219,7 +219,8 @@ All PDF output is optimised for Adobe Illustrator:
 
 ## Configuration Tips
 
-- **Scale bar**: `sb_len_mm` should match the physical length you want to display. Calculate from your microscope's pixel size × crop width.
+- **Scale bar**: Enter the desired scale bar length in **µm** (e.g., 10). The pixel size is **auto-detected** from Leica LAS X XML metadata (`Voxel` attribute or `Length / NumberOfElements`). If metadata is unavailable, the tool falls back to a manual **mm** value specifying the bar's physical print-panel length.
+- **Pixel size override**: The auto-detected pixel size (µm/px) is shown in the widget and can be manually adjusted if needed. Setting it to 0 reverts to the mm-based fallback.
 - **DPI**: Automatically calculated from crop width (px) ÷ panel width (mm / 25.4). Typical values: 300–600 DPI for print.
 - **Panel width**: 20 mm is standard for a single journal figure column. Adjust to your journal's requirements.
 
