@@ -655,7 +655,7 @@ class ColocManager:
             g_rgb     = self.make_rgb(norm_g, self.cfg.MIX_GREEN)
             m_rgb     = self.make_rgb(norm_m, self.cfg.MIX_MAGENTA)
             merge_rgb = np.clip(c_rgb + g_rgb + m_rgb, 0, 1)
-            bf_rgb    = np.stack((norm_bf,)*3, axis=-1)
+            bf_rgb    = np.clip(np.stack((norm_bf,)*3, axis=-1), 0, 1).astype(np.float32)
 
             zoom_rgb            = None
             zoom_coords_in_main = None
@@ -947,7 +947,7 @@ class ColocManager:
                 continue
 
             # --- Normal image panel ----------------------------------------
-            ax.imshow(img_data, aspect='auto')
+            ax.imshow(img_data, aspect='auto', interpolation='none')
             ax.axis('off')
             ax.text(0.05, 0.95, label, transform=ax.transAxes, color='white',
                     fontproperties=self.cfg.font_prop, ha='left', va='top')
@@ -1130,7 +1130,7 @@ class ColocManager:
                 if img_data is None:
                     img_data = black_zoom if key == 'zoom' else black_main
 
-                ax.imshow(img_data, aspect='auto')
+                ax.imshow(img_data, aspect='auto', interpolation='none')
                 ax.axis('off')
 
                 if r == 0:
