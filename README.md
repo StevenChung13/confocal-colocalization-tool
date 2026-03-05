@@ -99,54 +99,64 @@ Confocal_Workflow/
 
 ## Usage
 
+### Launching the Plugin
+
 ```bash
-python coloc_analyzer.py
+python -m napari_coloc_analyzer
 ```
 
-### Setup Wizard
+This opens Napari with the **Colocalization Analyzer** dock widget.
 
-The script opens an **interactive wizard** in the terminal:
+### Step 1 — Session Setup
 
-1. **Input folder** — path to your raw TIFF directory
-2. **Experiment name** — used for naming output files
-3. **Crop geometry** — width × height in pixels
-4. **Extra features** — brightfield panel, zoom/inset panel, intensity line profile
-5. **Channel labels** — text labels printed on each panel
-6. **Illustrator export settings** — physical panel size (mm), font size, scale bar length
-7. **Quantification** — enable/disable Pearson + Manders calculation
+In the dock widget, configure:
 
-### Napari Controls
-
-| Key | Action |
+| Setting | Description |
 |---|---|
-| `c` | Crop current ROI, save outputs, advance to next image |
-| `s` | Skip current image |
+| **Input Folder** | Click **Browse** or type the path to your TIFF directory |
+| **Experiment** | Name for the output folder (e.g. `MyExpt_2026-03-05`) |
+| **Crop (px)** | Width × height of the crop region (default: 360 × 360) |
 
-### Interactive Layers
+### Step 2 — Enable Features
+
+Toggle optional features as needed:
+
+- **Brightfield Panel** — includes a BF overlay panel in output
+- **Zoom / Enlargement** — adds a cyan inset box for a magnified region (set magnification, e.g. 3×)
+- **Intensity Line Profile** — adds a white line layer for drawing a fluorescence intensity profile
+- **Quantification (Pearson / Manders)** — computes Pearson R & Manders M1/M2 (enabled by default)
+
+### Step 3 — Channel Labels & Export Settings
+
+- Set channel labels (e.g. "DAPI", "GFP", "mCherry") — these appear on the output PDF panels
+- Adjust export settings for your journal: panel width (mm), spacing, font size, scale bar length
+
+### Step 4 — Load & Process
+
+Click **LOAD EXPERIMENT**. The plugin scans your input folder and loads the first image set into Napari with interactive shape layers:
 
 | Layer (colour) | Purpose |
 |---|---|
 | **1_MAIN_CROP** (yellow) | Main crop region — drag to position |
-| **2_ZOOM_ROI** (cyan) | Zoom inset region — must be inside the yellow box |
-| **3_LINE_PROFILE** (white) | Intensity line — draw a 2-point line for the fluorescent intensity profile |
+| **2_ZOOM_ROI** (cyan) | Zoom inset region — drag inside the yellow box (if zoom enabled) |
+| **3_LINE_PROFILE** (white) | Intensity line — drag endpoints across the structure of interest (if enabled) |
 
 > The shape-layer sanitiser automatically removes accidental shapes drawn in the wrong layer so you don't have to worry about cross-layer mistakes.
 
-### Post-processing Relabelling
+For each image:
 
-After closing Napari, the tool offers a **channel relabelling loop**:
+1. **Drag the yellow box** over the cell/structure you want to crop
+2. Position the **cyan box** (zoom) and **white line** (intensity profile) if enabled
+3. Click **Process & Next** to crop, compute stats, save outputs, and advance
+4. Click **Skip** to skip an image without processing
 
-```
---- Channel relabelling (enter blank line to finish) ---
-Current labels:
-  Cyan  = DAPI
-  Green = GFP
-  Mag   = mCherry
+### Step 5 — Finalize
 
-New Cyan label [DAPI]:
-```
+After all images are processed, click **FINALIZE** to generate the summary montage (PDF + PNG) and quantification CSV.
 
-Type a new label or press Enter to keep the current one. All panels (PDF/PNG), intensity CSVs, and the summary montage are regenerated automatically with the updated labels — **no need to re-run the entire pipeline**.
+### Step 6 — Relabel (Optional)
+
+After finalizing, the **Relabel Channels** section becomes active. Change any label and click **APPLY RELABELING** — all panels, CSVs, and the montage are regenerated instantly with updated labels. No need to reprocess.
 
 ---
 
