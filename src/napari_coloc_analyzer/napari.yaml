@@ -1,0 +1,10 @@
+name: napari-coloc-analyzer
+display_name: Colocalization Analyzer
+contributions:
+  commands:
+    - id: napari-coloc-analyzer.coloc_widget
+      python_name: napari_coloc_analyzer._widget:ColocWidget
+      title: Colocalization Analyzer
+  widgets:
+    - command: napari-coloc-analyzer.coloc_widget
+      display_name: Colocalization Analyzer

@@ -430,13 +430,28 @@ def load_flat(path):
     return raw
 
 
-def auto_contrast(img):
-    """Normalise *img* to [0, 1] using 0.1–99.9 percentile stretch."""
+def auto_contrast_limits(img):
+    """Return (vmin, vmax) percentile limits for *img*."""
     if img is None or img.size == 0:
-        return None
-    vmin, vmax = np.percentile(img, 0.1), np.percentile(img, 99.9)
+        return (0, 1)
+    vmin, vmax = np.percentile(img, 0.1), np.percentile(img, 99.98)
     if vmax <= vmin:
         vmax = vmin + 1
+    return (vmin, vmax)
+
+
+def auto_contrast(img, limits=None):
+    """Normalise *img* to [0, 1] using 0.1–99.98 percentile stretch.
+
+    If *limits* is provided as a ``(vmin, vmax)`` tuple, those values
+    are used instead of computing percentiles from *img*.
+    """
+    if img is None or img.size == 0:
+        return None
+    if limits is not None:
+        vmin, vmax = limits
+    else:
+        vmin, vmax = auto_contrast_limits(img)
     return np.clip((img.astype(float) - vmin) / (vmax - vmin), 0, 1)
 
 

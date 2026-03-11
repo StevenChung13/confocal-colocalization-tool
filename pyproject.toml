@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-coloc-analyzer"
+version = "0.1.0"
+description = "Napari plugin for confocal colocalization analysis"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "napari>=0.4.19",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "tifffile>=2023.1.1",
+    "matplotlib>=3.7",
+    "scikit-image>=0.21",
+    "scipy>=1.11",
+    "imagecodecs>=2024.1.1",
+]
+
+[project.entry-points."napari.manifest"]
+napari-coloc-analyzer = "napari_coloc_analyzer:napari.yaml"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+napari_coloc_analyzer = ["napari.yaml"]

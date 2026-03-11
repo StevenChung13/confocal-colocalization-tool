@@ -30,6 +30,7 @@ from napari_coloc_analyzer._core import (
     scan_directory,
     load_flat,
     auto_contrast,
+    auto_contrast_limits,
     make_rgb,
     get_box_center,
     safe_crop,
@@ -629,10 +630,15 @@ class ColocWidget(QWidget):
             else:
                 self._log("   >> Visuals only")
 
-            norm_c  = ensure_shape(auto_contrast(raw_crop_c))
-            norm_g  = ensure_shape(auto_contrast(raw_crop_g))
-            norm_m  = ensure_shape(auto_contrast(raw_crop_m))
-            norm_bf = ensure_shape(auto_contrast(raw_crop_bf))
+            lim_c  = auto_contrast_limits(raw_crop_c)
+            lim_g  = auto_contrast_limits(raw_crop_g)
+            lim_m  = auto_contrast_limits(raw_crop_m)
+            lim_bf = auto_contrast_limits(raw_crop_bf)
+
+            norm_c  = ensure_shape(auto_contrast(raw_crop_c, limits=lim_c))
+            norm_g  = ensure_shape(auto_contrast(raw_crop_g, limits=lim_g))
+            norm_m  = ensure_shape(auto_contrast(raw_crop_m, limits=lim_m))
+            norm_bf = ensure_shape(auto_contrast(raw_crop_bf, limits=lim_bf))
 
             c_rgb     = make_rgb(norm_c, self.cfg.MIX_CYAN)
             g_rgb     = make_rgb(norm_g, self.cfg.MIX_GREEN)
@@ -653,16 +659,16 @@ class ColocWidget(QWidget):
                 zx1, zx2 = zxc - zh, zxc + zh
                 target_px = self.cfg.zoom_upscaled_size
 
-                def zoom_crop_upscale_contrast(img_data):
+                def zoom_crop_upscale_contrast(img_data, limits):
                     crop = safe_crop(img_data, zy1, zy2, zx1, zx2)
                     if crop is None or crop.shape != (zs, zs):
                         return None
                     upscaled = upscale_channel(crop, target_px, target_px)
-                    return auto_contrast(upscaled)
+                    return auto_contrast(upscaled, limits=limits)
 
-                zn_c = zoom_crop_upscale_contrast(img_c)
-                zn_g = zoom_crop_upscale_contrast(img_g)
-                zn_m = zoom_crop_upscale_contrast(img_m)
+                zn_c = zoom_crop_upscale_contrast(img_c, lim_c)
+                zn_g = zoom_crop_upscale_contrast(img_g, lim_g)
+                zn_m = zoom_crop_upscale_contrast(img_m, lim_m)
 
                 z_rgb = np.zeros((target_px, target_px, 3))
                 if zn_c is not None: z_rgb += make_rgb(zn_c, self.cfg.MIX_CYAN)

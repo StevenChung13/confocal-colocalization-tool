@@ -457,12 +457,22 @@ class ColocManager:
             return np.max(raw, axis=0)
         return raw
 
-    def auto_contrast(self, img):
+    def auto_contrast_limits(self, img):
+        """Return (vmin, vmax) percentile limits for *img*."""
         if img is None or img.size == 0:
-            return None
-        vmin, vmax = np.percentile(img, 0.1), np.percentile(img, 99.9)
+            return (0, 1)
+        vmin, vmax = np.percentile(img, 0.1), np.percentile(img, 99.98)
         if vmax <= vmin:
             vmax = vmin + 1
+        return (vmin, vmax)
+
+    def auto_contrast(self, img, limits=None):
+        if img is None or img.size == 0:
+            return None
+        if limits is not None:
+            vmin, vmax = limits
+        else:
+            vmin, vmax = self.auto_contrast_limits(img)
         return np.clip((img.astype(float) - vmin) / (vmax - vmin), 0, 1)
 
     def make_rgb(self, norm, color_mix):
@@ -646,10 +656,15 @@ class ColocManager:
             else:
                 print("   >> Visuals only")
 
-            norm_c  = ensure_shape(self.auto_contrast(raw_crop_c))
-            norm_g  = ensure_shape(self.auto_contrast(raw_crop_g))
-            norm_m  = ensure_shape(self.auto_contrast(raw_crop_m))
-            norm_bf = ensure_shape(self.auto_contrast(raw_crop_bf))
+            lim_c  = self.auto_contrast_limits(raw_crop_c)
+            lim_g  = self.auto_contrast_limits(raw_crop_g)
+            lim_m  = self.auto_contrast_limits(raw_crop_m)
+            lim_bf = self.auto_contrast_limits(raw_crop_bf)
+
+            norm_c  = ensure_shape(self.auto_contrast(raw_crop_c, limits=lim_c))
+            norm_g  = ensure_shape(self.auto_contrast(raw_crop_g, limits=lim_g))
+            norm_m  = ensure_shape(self.auto_contrast(raw_crop_m, limits=lim_m))
+            norm_bf = ensure_shape(self.auto_contrast(raw_crop_bf, limits=lim_bf))
 
             c_rgb     = self.make_rgb(norm_c, self.cfg.MIX_CYAN)
             g_rgb     = self.make_rgb(norm_g, self.cfg.MIX_GREEN)
@@ -670,16 +685,16 @@ class ColocManager:
                 zx1, zx2 = zxc - zh, zxc + zh
                 target_px = self.cfg.zoom_upscaled_size  
 
-                def zoom_crop_upscale_contrast(img_data):
+                def zoom_crop_upscale_contrast(img_data, limits):
                     crop = self.safe_crop(img_data, zy1, zy2, zx1, zx2)
                     if crop is None or crop.shape != (zs, zs):
                         return None
                     upscaled = self.upscale_channel(crop, target_px, target_px)
-                    return self.auto_contrast(upscaled)
+                    return self.auto_contrast(upscaled, limits=limits)
 
-                zn_c = zoom_crop_upscale_contrast(img_c)
-                zn_g = zoom_crop_upscale_contrast(img_g)
-                zn_m = zoom_crop_upscale_contrast(img_m)
+                zn_c = zoom_crop_upscale_contrast(img_c, lim_c)
+                zn_g = zoom_crop_upscale_contrast(img_g, lim_g)
+                zn_m = zoom_crop_upscale_contrast(img_m, lim_m)
 
                 z_rgb = np.zeros((target_px, target_px, 3))
                 if zn_c is not None: z_rgb += self.make_rgb(zn_c, self.cfg.MIX_CYAN)
