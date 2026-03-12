@@ -47,6 +47,9 @@ except ImportError:
         "      pip install imagecodecs\n"
     )
     exit(1)
+import pickle
+import math
+from PIL import Image
 import pandas as pd
 import tifffile
 import matplotlib
@@ -95,12 +98,15 @@ class SessionConfig:
 
         # 2. OUTPUT DIRECTORY -----------------------------------------------
         print("\n--- DATA DESTINATION ---")
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        default_exp = f"Experiment_{today}"
+        today = datetime.datetime.now().strftime("%Y%m%d")
+        self.date_folder = get_user_input("Date Folder (YYYYMMDD)", today)
+
+        default_exp = f"Experiment_{self.date_folder}"
         self.exp_name = get_user_input("Experiment Name", default_exp)
 
         base_out = os.path.join(BASE_DIR, "Output_Coloc")
-        self.output_dir = os.path.join(base_out, self.exp_name)
+        self.date_dir = os.path.join(base_out, self.date_folder)
+        self.output_dir = os.path.join(self.date_dir, self.exp_name)
         os.makedirs(self.output_dir, exist_ok=True)
 
         # 3. CROP GEOMETRY --------------------------------------------------
@@ -418,9 +424,6 @@ class ColocManager:
         self.viewer.bind_key('s', self.skip_and_next)
         self.load_current_set()
         napari.run()
-
-        # Runs after the Napari window closes (Qt event loop finished)
-        self._relabel_loop()
 
     # ------------------------------------------------------------------
     #  Directory scanning
@@ -1001,52 +1004,21 @@ class ColocManager:
             df.to_csv(csv_path, index=False)
             print(f">> STATS SAVED: {csv_path}")
 
+        # Save session record for future replay
+        save_session_record(self.cfg, self.gallery, self.stats_log)
+
+        # Build date-level mega-montage
+        gap_px = round(self.cfg.spacing_pt / 72.0 * self.cfg.dpi)
+        build_date_summary(self.cfg.date_dir, self.cfg.date_folder, gap_px=gap_px)
+
     # ------------------------------------------------------------------
-    #  Post-processing relabeling
+    #  Regeneration helpers (used by replay)
     # ------------------------------------------------------------------
-    def _relabel_loop(self):
-        """Allow the user to change channel labels and regenerate all figures."""
-        while True:
-            resp = get_user_input(
-                "\nWould you like to relabel channels? [y/n]", "n").lower()
-            if resp != 'y':
-                print(">> No relabeling requested. Done.")
-                break
-
-            print("\n--- RELABEL CHANNELS ---")
-            print("   (Press Enter to keep the current label)")
-            self.cfg.lbl_c     = get_user_input(
-                f"Cyan Label",    self.cfg.lbl_c)
-            self.cfg.lbl_g     = get_user_input(
-                f"Green Label",   self.cfg.lbl_g)
-            self.cfg.lbl_m     = get_user_input(
-                f"Magenta Label", self.cfg.lbl_m)
-            self.cfg.lbl_merge = get_user_input(
-                f"Merge Label",   self.cfg.lbl_merge)
-            if self.cfg.do_zoom:
-                self.cfg.lbl_zoom = get_user_input(
-                    f"Enlargement Label", self.cfg.lbl_zoom)
-            if self.cfg.do_bf:
-                self.cfg.lbl_bf = get_user_input(
-                    f"Brightfield Label", self.cfg.lbl_bf)
-
-            # Re-save CSV with updated column headers first (updates DataFrames)
-            self._regenerate_intensity_csvs()
-
-            print("\n>>> Regenerating all panel views with new labels...")
-            self._regenerate_all_panels()
-
-            print(">>> Regenerating summary montage with new labels...")
-            if self.gallery:
-                self.build_global_montage()
-
-            print(">>> Relabeling complete.")
-
     def _regenerate_all_panels(self):
         """Re-draw and overwrite every individual Panel_View using current labels."""
         for item in self.gallery:
             name = item['name']
-            self.mode = item['mode']  # restore per-image mode for panel logic
+            self.mode = item['mode']
             self.save_individual_and_local_panel(
                 name,
                 item['cyan'],
@@ -1056,7 +1028,7 @@ class ColocManager:
                 item.get('bf'),
                 item.get('zoom'),
                 item.get('zoom_coords'),
-                None, None,  # mask_g, mask_m – TIFFs already saved
+                None, None,
                 intensity_data=item.get('intensity_data'),
                 line_coords_crop=item.get('line_coords'),
             )
@@ -1068,14 +1040,12 @@ class ColocManager:
             raw = item.get('raw_profiles')
             if raw is None:
                 continue
-            # Rebuild DataFrame with current label names
             new_dict = {'Distance_px': raw['distance']}
             if 'cyan' in raw:
                 new_dict[self.cfg.lbl_c] = raw['cyan']
             new_dict[self.cfg.lbl_g] = raw['green']
             new_dict[self.cfg.lbl_m] = raw['mag']
             new_df = pd.DataFrame(new_dict)
-            # Update the stored intensity_data so panel regen uses new labels
             item['intensity_data'] = new_df
             save_dir = os.path.join(self.cfg.output_dir, item['name'])
             new_df.to_csv(
@@ -1178,7 +1148,160 @@ class ColocManager:
 
 
 # ================================================================
+#  SESSION RECORD  (pickle save / load)
+# ================================================================
+def save_session_record(cfg, gallery, stats_log):
+    """Pickle the session state so it can be replayed later."""
+    record = {
+        'cfg': cfg,
+        'gallery': gallery,
+        'stats_log': stats_log,
+    }
+    pkl_path = os.path.join(cfg.output_dir,
+                            f"{cfg.exp_name}_session_record.pkl")
+    with open(pkl_path, 'wb') as f:
+        pickle.dump(record, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f">> SESSION RECORD SAVED: {pkl_path}")
+
+
+def load_session_record(pkl_path):
+    """Load a previously saved session record."""
+    with open(pkl_path, 'rb') as f:
+        record = pickle.load(f)
+    return record['cfg'], record['gallery'], record['stats_log']
+
+
+# ================================================================
+#  DATE-LEVEL MEGA-MONTAGE
+# ================================================================
+def build_date_summary(date_dir, date_folder, gap_px=20):
+    """Collect all *_SUMMARY_MONTAGE.png under *date_dir* and arrange
+    them in a two-column layout.
+
+    Each sub-montage is scaled to a uniform column width while preserving
+    its original aspect ratio.  Images are placed into whichever column
+    is currently shorter (masonry packing) to keep columns balanced.
+    """
+    montage_paths = sorted(glob.glob(
+        os.path.join(date_dir, "**", "*_SUMMARY_MONTAGE.png"), recursive=True))
+    if len(montage_paths) < 1:
+        return
+
+    images = [Image.open(p) for p in montage_paths]
+    gap = max(gap_px, 1)
+
+    # Scale every image to the same column width, preserving aspect ratio
+    max_w = max(img.width for img in images)
+    col_w = max_w  # each column gets this width
+    scaled = []
+    for img in images:
+        if img.width != col_w:
+            new_h = round(img.height * col_w / img.width)
+            img = img.resize((col_w, new_h), Image.LANCZOS)
+        scaled.append(img)
+
+    # Masonry packing: place each image in the shorter column
+    col_heights = [0, 0]  # running height for each column
+    placements = []       # (col_index, y_offset) per image
+    for img in scaled:
+        ci = 0 if col_heights[0] <= col_heights[1] else 1
+        placements.append((ci, col_heights[ci]))
+        col_heights[ci] += img.height + gap
+
+    total_w = col_w * 2 + gap
+    total_h = max(col_heights)  # strip trailing gap
+    if total_h > gap:
+        total_h -= gap
+
+    mega = Image.new('RGBA', (total_w, total_h), (0, 0, 0, 0))
+    for img, (ci, y) in zip(scaled, placements):
+        x = ci * (col_w + gap)
+        mega.paste(img, (x, y))
+
+    base = os.path.join(date_dir, f"{date_folder}_MEGA_SUMMARY")
+    mega.save(f"{base}.png", dpi=(300, 300))
+    mega.save(f"{base}.pdf", dpi=(300, 300))
+    print(f">> MEGA-MONTAGE SAVED: {base}.png / .pdf")
+
+
+# ================================================================
+#  REPLAY  (load record → tweak parameters → regenerate)
+# ================================================================
+def replay_session():
+    """Interactive replay: load a pickle, let user tweak labels/layout, re-render."""
+    pkl_path = input("Path to session_record.pkl: ").strip()
+    if not os.path.isfile(pkl_path):
+        print(f"File not found: {pkl_path}")
+        return
+
+    cfg, gallery, stats_log = load_session_record(pkl_path)
+
+    print(f"\nLoaded session: {cfg.exp_name}")
+    print(f"  Images: {len(gallery)}")
+    print(f"  Output: {cfg.output_dir}")
+
+    # --- Let user tweak any display parameter ---
+    print("\n--- ADJUST PARAMETERS (Enter to keep current) ---")
+    cfg.lbl_c     = get_user_input(f"Cyan Label",        cfg.lbl_c)
+    cfg.lbl_g     = get_user_input(f"Green Label",       cfg.lbl_g)
+    cfg.lbl_m     = get_user_input(f"Magenta Label",     cfg.lbl_m)
+    cfg.lbl_merge = get_user_input(f"Merge Label",       cfg.lbl_merge)
+    if cfg.do_zoom:
+        cfg.lbl_zoom = get_user_input(f"Enlargement Label", cfg.lbl_zoom)
+    if cfg.do_bf:
+        cfg.lbl_bf = get_user_input(f"Brightfield Label", cfg.lbl_bf)
+
+    new_font = get_user_input(f"Font Size (pt)", str(cfg.font_size))
+    cfg.font_size = int(new_font)
+    cfg.font_prop = fm.FontProperties(family='Arial', size=cfg.font_size)
+
+    new_pw = get_user_input(f"Panel Width (mm)", str(cfg.panel_w_mm))
+    cfg.panel_w_mm = float(new_pw)
+    cfg.panel_w_inch = cfg.panel_w_mm / 25.4
+    if cfg.crop_w > 0:
+        cfg.scale = cfg.panel_w_inch / cfg.crop_w
+        cfg.panel_h_inch = cfg.crop_h * cfg.scale
+
+    new_dpi = get_user_input(f"DPI", str(cfg.dpi))
+    cfg.dpi = int(new_dpi)
+
+    # --- Create a temporary ColocManager-like object to call regeneration ---
+    mgr = ColocManager.__new__(ColocManager)
+    mgr.cfg = cfg
+    mgr.gallery = gallery
+    mgr.stats_log = stats_log
+    mgr.mode = gallery[0]['mode'] if gallery else 'DUAL'
+
+    # Regenerate intensity CSVs with updated labels
+    mgr._regenerate_intensity_csvs()
+
+    # Regenerate all panels
+    print("\n>>> Regenerating all panel views...")
+    mgr._regenerate_all_panels()
+
+    # Regenerate summary montage
+    if gallery:
+        print(">>> Regenerating summary montage...")
+        mgr.build_global_montage()
+
+    # Save updated session record
+    save_session_record(cfg, gallery, stats_log)
+
+    # Rebuild date-level mega-montage
+    if hasattr(cfg, 'date_dir') and hasattr(cfg, 'date_folder'):
+        gap_px = round(cfg.spacing_pt / 72.0 * cfg.dpi)
+        build_date_summary(cfg.date_dir, cfg.date_folder, gap_px=gap_px)
+
+    print("\n>>> Replay complete.")
+
+
+# ================================================================
 #  ENTRY POINT
 # ================================================================
 if __name__ == "__main__":
-    ColocManager()
+    choice = get_user_input(
+        "\nNew session [n] / Replay from record [r]", "n").lower()
+    if choice == 'r':
+        replay_session()
+    else:
+        ColocManager()

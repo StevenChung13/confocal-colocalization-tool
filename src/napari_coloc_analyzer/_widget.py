@@ -36,6 +36,9 @@ from napari_coloc_analyzer._core import (
     safe_crop,
     upscale_channel,
     FigureBuilder,
+    save_session_record,
+    load_session_record,
+    build_date_summary,
 )
 
 
@@ -110,10 +113,18 @@ class ColocWidget(QWidget):
         row_folder.addWidget(self.browse_btn)
         sl.addLayout(row_folder)
 
+        row_date = QHBoxLayout()
+        row_date.addWidget(QLabel("Date Folder:"))
+        self.date_folder_edit = QLineEdit()
+        import datetime as _dt
+        self.date_folder_edit.setPlaceholderText(_dt.datetime.now().strftime("%Y%m%d"))
+        row_date.addWidget(self.date_folder_edit)
+        sl.addLayout(row_date)
+
         row_exp = QHBoxLayout()
         row_exp.addWidget(QLabel("Experiment:"))
         self.exp_name_edit = QLineEdit()
-        self.exp_name_edit.setPlaceholderText("Experiment_YYYY-MM-DD")
+        self.exp_name_edit.setPlaceholderText("Experiment_YYYYMMDD")
         row_exp.addWidget(self.exp_name_edit)
         sl.addLayout(row_exp)
 
@@ -239,11 +250,20 @@ class ColocWidget(QWidget):
         layout.addWidget(grp_export)
         self.grp_export = grp_export
 
-        # === LOAD BUTTON ===
+        # === LOAD BUTTONS ===
+        row_load = QHBoxLayout()
         self.load_btn = QPushButton("LOAD EXPERIMENT")
         self.load_btn.setStyleSheet("font-weight: bold; padding: 8px;")
         self.load_btn.clicked.connect(self._on_load_experiment)
-        layout.addWidget(self.load_btn)
+        row_load.addWidget(self.load_btn)
+
+        self.load_record_btn = QPushButton("LOAD RECORD")
+        self.load_record_btn.setStyleSheet("font-weight: bold; padding: 8px;")
+        self.load_record_btn.setToolTip(
+            "Load a previous session record (.pkl) to tweak settings and re-generate.")
+        self.load_record_btn.clicked.connect(self._on_load_record)
+        row_load.addWidget(self.load_record_btn)
+        layout.addLayout(row_load)
 
         # 5. NAVIGATION
         grp_nav = QGroupBox("Navigation")
@@ -306,25 +326,20 @@ class ColocWidget(QWidget):
         self.finalize_btn.clicked.connect(self._on_finalize)
         layout.addWidget(self.finalize_btn)
 
-        # 7. RELABEL
-        grp_relabel = QGroupBox("Relabel Channels")
+        # 7. SESSION RECORD (save only — load button is above with LOAD EXPERIMENT)
+        grp_record = QGroupBox("Session Record")
         rl = QVBoxLayout()
 
-        self.relbl_c_edit = self._label_row(rl, "Cyan:", "Protein-Cyan")
-        self.relbl_g_edit = self._label_row(rl, "Green:", "Protein-GFP")
-        self.relbl_m_edit = self._label_row(rl, "Magenta:", "Protein-mCherry")
-        self.relbl_merge_edit = self._label_row(rl, "Merge:", "Merged")
-        self.relbl_zoom_edit = self._label_row(rl, "Zoom:", "3X enlarged")
-        self.relbl_bf_edit = self._label_row(rl, "BF:", "BF")
+        self.save_record_btn = QPushButton("SAVE SESSION RECORD")
+        self.save_record_btn.setStyleSheet("font-weight: bold; padding: 6px;")
+        self.save_record_btn.setToolTip(
+            "Save cfg + gallery + stats as a pickle for future replay.")
+        self.save_record_btn.clicked.connect(self._on_save_record)
+        rl.addWidget(self.save_record_btn)
 
-        self.relabel_btn = QPushButton("APPLY RELABELING")
-        self.relabel_btn.setStyleSheet("font-weight: bold; padding: 6px;")
-        self.relabel_btn.clicked.connect(self._on_relabel)
-        rl.addWidget(self.relabel_btn)
-
-        grp_relabel.setLayout(rl)
-        layout.addWidget(grp_relabel)
-        self.grp_relabel = grp_relabel
+        grp_record.setLayout(rl)
+        layout.addWidget(grp_record)
+        self.grp_record = grp_record
 
         # === NEW EXPERIMENT (RESET) BUTTON ===
         self.reset_btn = QPushButton("\u21bb  NEW EXPERIMENT")
@@ -374,10 +389,11 @@ class ColocWidget(QWidget):
             w.setEnabled(is_unconfigured or is_finalized)
 
         self.load_btn.setEnabled(is_unconfigured or is_finalized)
+        self.load_record_btn.setEnabled(is_unconfigured or is_finalized)
         self.grp_nav.setEnabled(is_viewing)
         self.back_btn.setEnabled(is_viewing and self.index > 0)
         self.finalize_btn.setEnabled(is_finalized)
-        self.grp_relabel.setEnabled(is_finalized)
+        self.grp_record.setEnabled(is_finalized)
         self.reset_btn.setEnabled(is_finalized)
         self.export_log_btn.setEnabled(is_viewing or is_finalized)
 
@@ -427,6 +443,7 @@ class ColocWidget(QWidget):
         # Build SessionConfig from widget values
         self.cfg = SessionConfig(
             input_dir=input_dir,
+            date_folder=self.date_folder_edit.text().strip() or None,
             exp_name=self.exp_name_edit.text().strip() or None,
             crop_w=self.crop_w_spin.value(),
             crop_h=self.crop_h_spin.value(),
@@ -834,6 +851,7 @@ class ColocWidget(QWidget):
         """Persist current widget values to a JSON file."""
         data = {
             'input_dir':    self.input_dir_edit.text(),
+            'date_folder':  self.date_folder_edit.text(),
             'exp_name':     self.exp_name_edit.text(),
             'crop_w':       self.crop_w_spin.value(),
             'crop_h':       self.crop_h_spin.value(),
@@ -872,6 +890,7 @@ class ColocWidget(QWidget):
 
         # Apply values defensively (missing keys are simply skipped)
         if d.get('input_dir'):    self.input_dir_edit.setText(d['input_dir'])
+        if d.get('date_folder'):  self.date_folder_edit.setText(d['date_folder'])
         if d.get('exp_name'):     self.exp_name_edit.setText(d['exp_name'])
         if 'crop_w' in d:        self.crop_w_spin.setValue(d['crop_w'])
         if 'crop_h' in d:        self.crop_h_spin.setValue(d['crop_h'])
@@ -896,37 +915,89 @@ class ColocWidget(QWidget):
     #  FINALIZE
     # ----------------------------------------------------------------
     def _on_finalize(self):
-        if self.fig_builder and self.gallery:
-            self.fig_builder.finalize_analysis(
-                self.gallery, self.stats_log, log=self._log)
-        self._log("All datasets processed. Montage and CSV saved.")
-        self._set_state(_FINALIZED)
+        if not self.cfg or not self.gallery:
+            self._log("Nothing to finalize — no processed data.")
+            return
 
-        # Pre-fill relabel fields with current labels
-        self.relbl_c_edit.setText(self.cfg.lbl_c)
-        self.relbl_g_edit.setText(self.cfg.lbl_g)
-        self.relbl_m_edit.setText(self.cfg.lbl_m)
-        self.relbl_merge_edit.setText(self.cfg.lbl_merge)
-        self.relbl_zoom_edit.setText(self.cfg.lbl_zoom)
-        self.relbl_bf_edit.setText(self.cfg.lbl_bf)
+        # --- Sync current UI values back into cfg -----------------------
+        self.cfg.lbl_c     = self.lbl_c_edit.text()
+        self.cfg.lbl_g     = self.lbl_g_edit.text()
+        self.cfg.lbl_m     = self.lbl_m_edit.text()
+        self.cfg.lbl_merge = self.lbl_merge_edit.text()
+        self.cfg.lbl_zoom  = self.lbl_zoom_edit.text()
+        self.cfg.lbl_bf    = self.lbl_bf_edit.text()
 
-    # ----------------------------------------------------------------
-    #  RELABEL
-    # ----------------------------------------------------------------
-    def _on_relabel(self):
-        self.cfg.lbl_c = self.relbl_c_edit.text()
-        self.cfg.lbl_g = self.relbl_g_edit.text()
-        self.cfg.lbl_m = self.relbl_m_edit.text()
-        self.cfg.lbl_merge = self.relbl_merge_edit.text()
-        self.cfg.lbl_zoom = self.relbl_zoom_edit.text()
-        self.cfg.lbl_bf = self.relbl_bf_edit.text()
+        new_pw = self.panel_w_spin.value()
+        if new_pw != self.cfg.panel_w_mm:
+            self.cfg.panel_w_mm = new_pw
+            self.cfg.panel_w_inch = new_pw / 25.4
+            if self.cfg.crop_w > 0:
+                self.cfg.scale = self.cfg.panel_w_inch / self.cfg.crop_w
+                self.cfg.panel_h_inch = self.cfg.crop_h * self.cfg.scale
+                self.cfg.dpi = self.cfg.crop_w / self.cfg.panel_w_inch
 
-        self._log(">>> Regenerating with new labels...")
+        new_fs = self.font_spin.value()
+        if new_fs != self.cfg.font_size:
+            self.cfg.font_size = new_fs
+            self.cfg.font_prop.set_size(new_fs)
+
+        self.cfg.spacing_pt = self.spacing_spin.value()
+        self.cfg.spacing_inch = self.cfg.spacing_pt / 72.0
+
+        # Rebuild FigureBuilder with updated cfg
+        self.fig_builder = FigureBuilder(self.cfg)
+
+        # --- Regenerate individual panels & CSVs ------------------------
+        self._log(">>> Regenerating individual panels with current settings...")
         self.fig_builder.regenerate_intensity_csvs(self.gallery, log=self._log)
         self.fig_builder.regenerate_all_panels(self.gallery, log=self._log)
-        if self.gallery:
-            self.fig_builder.build_global_montage(self.gallery, log=self._log)
-        self._log(">>> Relabeling complete.")
+
+        # --- Montage, CSV, session record, mega-montage -----------------
+        self.fig_builder.finalize_analysis(
+            self.gallery, self.stats_log, log=self._log)
+        self._log("All outputs regenerated. Montage, CSV, and session record saved.")
+        self._set_state(_FINALIZED)
+
+    # ----------------------------------------------------------------
+    #  SESSION RECORD
+    # ----------------------------------------------------------------
+    def _on_save_record(self):
+        if not self.cfg or not self.gallery:
+            self._log("Nothing to save — no processed data.")
+            return
+        save_session_record(self.cfg, self.gallery, self.stats_log)
+        self._log(f"Session record saved to {self.cfg.output_dir}")
+
+    def _on_load_record(self):
+        pkl_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Session Record", "",
+            "Pickle files (*.pkl);;All files (*)")
+        if not pkl_path:
+            return
+
+        cfg, gallery, stats_log = load_session_record(pkl_path)
+
+        # Populate widget fields from loaded config
+        self.cfg = cfg
+        self.gallery = gallery
+        self.stats_log = stats_log
+        self.fig_builder = FigureBuilder(cfg)
+
+        self.date_folder_edit.setText(getattr(cfg, 'date_folder', ''))
+        self.exp_name_edit.setText(cfg.exp_name)
+        self.lbl_c_edit.setText(cfg.lbl_c)
+        self.lbl_g_edit.setText(cfg.lbl_g)
+        self.lbl_m_edit.setText(cfg.lbl_m)
+        self.lbl_merge_edit.setText(cfg.lbl_merge)
+        self.lbl_zoom_edit.setText(cfg.lbl_zoom)
+        self.lbl_bf_edit.setText(cfg.lbl_bf)
+        self.panel_w_spin.setValue(cfg.panel_w_mm)
+        self.font_spin.setValue(cfg.font_size)
+        self.spacing_spin.setValue(cfg.spacing_pt)
+
+        self._log(f"Loaded record: {cfg.exp_name} ({len(gallery)} images)")
+        self._log("Edit labels / export settings above, then click FINALIZE to regenerate.")
+        self._set_state(_FINALIZED)
 
     # ----------------------------------------------------------------
     #  RESET (NEW EXPERIMENT)

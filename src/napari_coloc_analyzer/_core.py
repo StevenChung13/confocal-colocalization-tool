@@ -14,6 +14,9 @@ import datetime
 import re
 import warnings
 import xml.etree.ElementTree as ET
+import pickle
+import math
+from PIL import Image
 
 import numpy as np
 import pandas as pd
@@ -54,6 +57,7 @@ class SessionConfig:
 
     def __init__(self, *,
                  input_dir=None,
+                 date_folder=None,
                  exp_name=None,
                  crop_w=360,
                  crop_h=360,
@@ -77,11 +81,13 @@ class SessionConfig:
 
         # --- Direct parameters ---
         self.input_dir = input_dir or os.path.join(BASE_DIR, "Input_Raw")
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
+        today = datetime.datetime.now().strftime("%Y%m%d")
+        self.date_folder = date_folder or today
         self.exp_name = exp_name or f"Experiment_{today}"
 
         base_out = os.path.join(BASE_DIR, "Output_Coloc")
-        self.output_dir = os.path.join(base_out, self.exp_name)
+        self.date_dir = os.path.join(base_out, self.date_folder)
+        self.output_dir = os.path.join(self.date_dir, self.exp_name)
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.crop_w = int(crop_w)
@@ -680,7 +686,15 @@ class FigureBuilder:
             df.to_csv(csv_path, index=False)
             log(f">> STATS SAVED: {csv_path}")
 
-    # ----- relabeling helpers -----
+        # Save session record for future replay
+        save_session_record(self.cfg, gallery, stats_log)
+
+        # Build date-level mega-montage
+        gap_px = round(self.cfg.spacing_pt / 72.0 * self.cfg.dpi)
+        build_date_summary(self.cfg.date_dir, self.cfg.date_folder,
+                           gap_px=gap_px, log=log)
+
+    # ----- regeneration helpers -----
     def regenerate_all_panels(self, gallery, log=print):
         for item in gallery:
             name = item['name']
@@ -805,3 +819,80 @@ class FigureBuilder:
         plt.savefig(f"{base_name}.png", dpi=self.cfg.dpi)
         log(f">> MONTAGE SAVED: {base_name}.pdf")
         plt.close(fig)
+
+
+# ================================================================
+#  SESSION RECORD  (pickle save / load)
+# ================================================================
+def save_session_record(cfg, gallery, stats_log):
+    """Pickle the session state so it can be replayed later."""
+    record = {
+        'cfg': cfg,
+        'gallery': gallery,
+        'stats_log': stats_log,
+    }
+    pkl_path = os.path.join(cfg.output_dir,
+                            f"{cfg.exp_name}_session_record.pkl")
+    with open(pkl_path, 'wb') as f:
+        pickle.dump(record, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f">> SESSION RECORD SAVED: {pkl_path}")
+
+
+def load_session_record(pkl_path):
+    """Load a previously saved session record."""
+    with open(pkl_path, 'rb') as f:
+        record = pickle.load(f)
+    return record['cfg'], record['gallery'], record['stats_log']
+
+
+# ================================================================
+#  DATE-LEVEL MEGA-MONTAGE
+# ================================================================
+def build_date_summary(date_dir, date_folder, gap_px=20, log=print):
+    """Collect all *_SUMMARY_MONTAGE.png under *date_dir* and arrange
+    them in a two-column layout.
+
+    Each sub-montage is scaled to a uniform column width while preserving
+    its original aspect ratio.  Images are placed into whichever column
+    is currently shorter (masonry packing) to keep columns balanced.
+    """
+    montage_paths = sorted(glob.glob(
+        os.path.join(date_dir, "**", "*_SUMMARY_MONTAGE.png"), recursive=True))
+    if len(montage_paths) < 1:
+        return
+
+    images = [Image.open(p) for p in montage_paths]
+    gap = max(gap_px, 1)
+
+    # Scale every image to the same column width, preserving aspect ratio
+    max_w = max(img.width for img in images)
+    col_w = max_w  # each column gets this width
+    scaled = []
+    for img in images:
+        if img.width != col_w:
+            new_h = round(img.height * col_w / img.width)
+            img = img.resize((col_w, new_h), Image.LANCZOS)
+        scaled.append(img)
+
+    # Masonry packing: place each image in the shorter column
+    col_heights = [0, 0]  # running height for each column
+    placements = []       # (col_index, y_offset) per image
+    for img in scaled:
+        ci = 0 if col_heights[0] <= col_heights[1] else 1
+        placements.append((ci, col_heights[ci]))
+        col_heights[ci] += img.height + gap
+
+    total_w = col_w * 2 + gap
+    total_h = max(col_heights)  # strip trailing gap
+    if total_h > gap:
+        total_h -= gap
+
+    mega = Image.new('RGBA', (total_w, total_h), (0, 0, 0, 0))
+    for img, (ci, y) in zip(scaled, placements):
+        x = ci * (col_w + gap)
+        mega.paste(img, (x, y))
+
+    base = os.path.join(date_dir, f"{date_folder}_MEGA_SUMMARY")
+    mega.save(f"{base}.png", dpi=(300, 300))
+    mega.save(f"{base}.pdf", dpi=(300, 300))
+    log(f">> MEGA-MONTAGE SAVED: {base}.png / .pdf")
