@@ -27,7 +27,18 @@ import matplotlib.patches as patches
 from matplotlib.font_manager import FontProperties
 from skimage.transform import resize
 from skimage.measure import profile_line
+from skimage.restoration import (
+    denoise_nl_means,
+    denoise_tv_chambolle,
+    denoise_wavelet,
+    denoise_bilateral,
+    estimate_sigma as _estimate_sigma,
+    richardson_lucy,
+    wiener,
+    unsupervised_wiener,
+)
 from scipy.stats import pearsonr
+from scipy.ndimage import median_filter, gaussian_filter
 
 # imagecodecs is required by tifffile to decompress LZW / Deflate (ZIP)
 # compressed TIFFs, which is the default lossless export format in Leica LAS X.
@@ -77,7 +88,17 @@ class SessionConfig:
                  font_size=5.0,
                  sb_len_mm=2.646,
                  sb_um=10.0,
-                 pixel_size_um=None):
+                 pixel_size_um=None,
+                 do_denoise=False,
+                 denoise_method="wavelet",
+                 denoise_strength=1.0,
+                 do_deconvolve=False,
+                 deconv_method="richardson_lucy",
+                 deconv_iterations=15,
+                 psf_source="synthetic",
+                 psf_path=None,
+                 na=1.4,
+                 wavelength_nm=520.0):
 
         # --- Direct parameters ---
         self.input_dir = input_dir or os.path.join(BASE_DIR, "Input_Raw")
@@ -114,6 +135,18 @@ class SessionConfig:
         self.sb_len_mm = float(sb_len_mm)
         self.sb_um = float(sb_um)
         self.pixel_size_um = float(pixel_size_um) if pixel_size_um else None
+
+        # --- Denoise / Deconvolution parameters ---
+        self.do_denoise = do_denoise
+        self.denoise_method = denoise_method
+        self.denoise_strength = float(denoise_strength)
+        self.do_deconvolve = do_deconvolve
+        self.deconv_method = deconv_method
+        self.deconv_iterations = int(deconv_iterations)
+        self.psf_source = psf_source
+        self.psf_path = psf_path
+        self.na = float(na)
+        self.wavelength_nm = float(wavelength_nm)
 
         # --- Derived values (identical to coloc_analyzer.py lines 158-183) ---
         self.aspect_ratio = self.crop_h / self.crop_w
@@ -495,6 +528,205 @@ def upscale_channel(crop, target_h, target_w):
     return resize(
         crop.astype(np.float64), (target_h, target_w),
         order=3, anti_aliasing=False, preserve_range=True)
+
+
+# ================================================================
+#  DENOISE
+# ================================================================
+def estimate_sigma(image):
+    """Estimate noise standard deviation using the robust MAD estimator."""
+    if image is None or image.size == 0:
+        return 0.0
+    return float(_estimate_sigma(image.astype(np.float64)))
+
+
+def denoise_image(image, method, strength=1.0):
+    """Apply a denoising filter to a 2-D image.
+
+    Parameters
+    ----------
+    image : ndarray or None
+        Raw 2-D image.  ``None`` is passed through.
+    method : str
+        One of ``"median"``, ``"gaussian"``, ``"nlm"``, ``"tv"``,
+        ``"wavelet"``, ``"bilateral"``.
+    strength : float
+        Method-dependent strength parameter (see below).
+
+    Returns
+    -------
+    ndarray
+        Denoised image, same shape as input, with ``preserve_range``
+        semantics (output range matches input range).
+    """
+    if image is None or image.size == 0:
+        return image
+
+    img = image.astype(np.float64)
+
+    if method == "median":
+        kernel = int(max(3, 2 * round(strength) + 1))  # odd kernel size
+        return median_filter(img, size=kernel)
+
+    if method == "gaussian":
+        return gaussian_filter(img, sigma=max(0.1, strength))
+
+    if method == "nlm":
+        sigma = estimate_sigma(img)
+        h = max(0.01, strength * sigma)
+        return denoise_nl_means(
+            img, h=h, patch_size=5, patch_distance=6,
+            fast_mode=True, preserve_range=True, channel_axis=None)
+
+    if method == "tv":
+        weight = max(0.01, strength * 0.1)
+        return denoise_tv_chambolle(img, weight=weight, channel_axis=None)
+
+    if method == "wavelet":
+        sigma = estimate_sigma(img) * strength
+        return denoise_wavelet(
+            img, method='BayesShrink', mode='soft',
+            sigma=sigma if sigma > 0 else None,
+            rescale_sigma=True, channel_axis=None)
+
+    if method == "bilateral":
+        sigma_spatial = max(1.0, strength * 2.0)
+        return denoise_bilateral(
+            img, sigma_spatial=sigma_spatial,
+            channel_axis=None)
+
+    # "none" or unrecognised → passthrough
+    return img
+
+
+# ================================================================
+#  DECONVOLUTION
+# ================================================================
+def generate_gaussian_psf(na, wavelength_nm, pixel_size_um, size=None):
+    """Generate a 2-D Gaussian PSF for a confocal microscope.
+
+    Parameters
+    ----------
+    na : float
+        Numerical aperture of the objective.
+    wavelength_nm : float
+        Emission wavelength in nanometres.
+    pixel_size_um : float
+        Pixel size in micrometres per pixel.
+    size : int or None
+        Kernel side length (will be forced to odd).  If ``None``, auto-
+        computed as ``6 * sigma`` rounded up to the nearest odd integer.
+
+    Returns
+    -------
+    ndarray
+        Normalised 2-D Gaussian PSF (sums to 1).
+    """
+    wavelength_um = wavelength_nm / 1000.0
+    sigma_um = 0.21 * wavelength_um / na
+    sigma_px = sigma_um / pixel_size_um
+
+    if size is None:
+        size = int(np.ceil(6 * sigma_px))
+        if size % 2 == 0:
+            size += 1
+        size = max(size, 3)
+
+    centre = size // 2
+    y, x = np.mgrid[:size, :size] - centre
+    psf = np.exp(-(x**2 + y**2) / (2 * sigma_px**2))
+    psf /= psf.sum()
+    return psf
+
+
+def load_psf(path):
+    """Load a measured PSF from a TIFF file and normalise it.
+
+    Parameters
+    ----------
+    path : str
+        Path to a single-channel TIFF containing the PSF.
+
+    Returns
+    -------
+    ndarray
+        Normalised 2-D PSF (sums to 1).
+    """
+    raw = tifffile.imread(path)
+    raw = np.squeeze(raw).astype(np.float64)
+    while raw.ndim > 2:
+        raw = np.max(raw, axis=0)
+    total = raw.sum()
+    if total > 0:
+        raw /= total
+    return raw
+
+
+def deconvolve_image(image, psf, method, num_iter=15):
+    """Apply deconvolution to a 2-D image.
+
+    Parameters
+    ----------
+    image : ndarray or None
+        Input 2-D image.  ``None`` is passed through.
+    psf : ndarray
+        2-D point spread function (should sum to 1).
+    method : str
+        One of ``"richardson_lucy"``, ``"wiener"``,
+        ``"unsupervised_wiener"``.
+    num_iter : int
+        Iteration count (used by Richardson-Lucy only).
+
+    Returns
+    -------
+    ndarray
+        Deconvolved image, same shape as input.
+    """
+    if image is None or image.size == 0:
+        return image
+
+    img = image.astype(np.float64)
+    # Ensure non-negative input (RL requires it)
+    img = np.clip(img, 0, None)
+
+    if method == "richardson_lucy":
+        return richardson_lucy(img, psf, num_iter=int(num_iter), clip=True)
+
+    if method == "wiener":
+        # Use a small regularisation (balance) parameter
+        return wiener(img, psf, balance=0.05)
+
+    if method == "unsupervised_wiener":
+        result, _ = unsupervised_wiener(img, psf)
+        return np.clip(result, 0, None)
+
+    # "none" or unrecognised → passthrough
+    return img
+
+
+# ================================================================
+#  UNIFIED CONTRAST LIMITS
+# ================================================================
+def unified_contrast_limits(*images):
+    """Compute a single (vmin, vmax) from the widest percentile range
+    across all supplied images.
+
+    This prevents per-channel intensity mismatch when denoising or
+    deconvolution shifts each channel's noise floor differently.
+    """
+    vmins, vmaxs = [], []
+    for img in images:
+        if img is None or img.size == 0:
+            continue
+        lo, hi = np.percentile(img, 0.1), np.percentile(img, 99.98)
+        vmins.append(lo)
+        vmaxs.append(hi)
+    if not vmins:
+        return (0, 1)
+    vmin, vmax = min(vmins), max(vmaxs)
+    if vmax <= vmin:
+        vmax = vmin + 1
+    return (vmin, vmax)
 
 
 # ================================================================

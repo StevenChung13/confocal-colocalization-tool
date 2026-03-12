@@ -17,7 +17,7 @@ from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QLineEdit, QSpinBox, QDoubleSpinBox,
     QCheckBox, QPushButton, QTextEdit, QFileDialog,
-    QScrollArea, QSizePolicy, QProgressBar,
+    QScrollArea, QSizePolicy, QProgressBar, QComboBox,
 )
 from qtpy.QtCore import Qt
 from skimage.measure import profile_line
@@ -31,10 +31,15 @@ from napari_coloc_analyzer._core import (
     load_flat,
     auto_contrast,
     auto_contrast_limits,
+    unified_contrast_limits,
     make_rgb,
     get_box_center,
     safe_crop,
     upscale_channel,
+    denoise_image,
+    deconvolve_image,
+    generate_gaussian_psf,
+    load_psf,
     FigureBuilder,
     save_session_record,
     load_session_record,
@@ -164,6 +169,132 @@ class ColocWidget(QWidget):
         self.quant_check = QCheckBox("Quantification (Pearson / Manders)")
         self.quant_check.setChecked(True)
         fl.addWidget(self.quant_check)
+
+        # --- Denoise controls ---
+        self.denoise_check = QCheckBox("Denoise")
+        fl.addWidget(self.denoise_check)
+
+        row_dn = QHBoxLayout()
+        row_dn.addWidget(QLabel("Method:"))
+        self.denoise_method_combo = QComboBox()
+        self.denoise_method_combo.addItems([
+            "Wavelet", "Non-Local Means", "Total Variation",
+            "Median", "Gaussian", "Bilateral"])
+        _dn_tips = {
+            0: "Wavelet — Best all-round. Preserves edges and fine"
+               " structure.  Use for most confocal images.",
+            1: "Non-Local Means — Averages similar patches."
+               "  Best when noise is moderate and textures repeat.",
+            2: "Total Variation — Reduces noise while keeping"
+               " sharp edges.  Good for piecewise-constant signals.",
+            3: "Median — Fast rank filter.  Removes salt-and-pepper"
+               " / shot noise without blurring edges.",
+            4: "Gaussian — Simple smoothing.  Use for mild,"
+               " uniform noise when speed matters.",
+            5: "Bilateral — Edge-aware smoothing.  Preserves"
+               " boundaries; good for mixed-texture samples.",
+        }
+        for idx, tip in _dn_tips.items():
+            self.denoise_method_combo.setItemData(idx, tip, Qt.ToolTipRole)
+        self.denoise_method_combo.setEnabled(False)
+        row_dn.addWidget(self.denoise_method_combo)
+        row_dn.addWidget(QLabel("Strength:"))
+        self.denoise_strength_spin = QDoubleSpinBox()
+        self.denoise_strength_spin.setRange(0.1, 10.0)
+        self.denoise_strength_spin.setValue(1.0)
+        self.denoise_strength_spin.setSingleStep(0.1)
+        self.denoise_strength_spin.setDecimals(1)
+        self.denoise_strength_spin.setEnabled(False)
+        row_dn.addWidget(self.denoise_strength_spin)
+        fl.addLayout(row_dn)
+        self.denoise_check.toggled.connect(self.denoise_method_combo.setEnabled)
+        self.denoise_check.toggled.connect(self.denoise_strength_spin.setEnabled)
+
+        # --- Deconvolution controls ---
+        self.deconv_check = QCheckBox("Deconvolution")
+        fl.addWidget(self.deconv_check)
+
+        row_dc = QHBoxLayout()
+        row_dc.addWidget(QLabel("Method:"))
+        self.deconv_method_combo = QComboBox()
+        self.deconv_method_combo.addItems([
+            "Richardson-Lucy", "Wiener", "Unsupervised Wiener"])
+        _dc_tips = {
+            0: "Richardson-Lucy — Iterative ML method.  Best for"
+               " Poisson (photon) noise typical of confocal/"
+               "fluorescence data.  More iterations = sharper.",
+            1: "Wiener — Single-step frequency-domain filter."
+               "  Very fast; good when noise level is roughly"
+               " known and speed is a priority.",
+            2: "Unsupervised Wiener — Auto-estimates noise power."
+               "  Use when the noise level is unknown; no manual"
+               " tuning needed.",
+        }
+        for idx, tip in _dc_tips.items():
+            self.deconv_method_combo.setItemData(idx, tip, Qt.ToolTipRole)
+        self.deconv_method_combo.setEnabled(False)
+        row_dc.addWidget(self.deconv_method_combo)
+        row_dc.addWidget(QLabel("Iterations:"))
+        self.deconv_iter_spin = QSpinBox()
+        self.deconv_iter_spin.setRange(1, 200)
+        self.deconv_iter_spin.setValue(15)
+        self.deconv_iter_spin.setEnabled(False)
+        row_dc.addWidget(self.deconv_iter_spin)
+        fl.addLayout(row_dc)
+        self.deconv_check.toggled.connect(self.deconv_method_combo.setEnabled)
+        self.deconv_check.toggled.connect(self.deconv_iter_spin.setEnabled)
+
+        row_psf = QHBoxLayout()
+        row_psf.addWidget(QLabel("PSF:"))
+        self.psf_source_combo = QComboBox()
+        self.psf_source_combo.addItems(["Synthetic", "Load from file"])
+        self.psf_source_combo.setEnabled(False)
+        row_psf.addWidget(self.psf_source_combo)
+        fl.addLayout(row_psf)
+        self.deconv_check.toggled.connect(self.psf_source_combo.setEnabled)
+
+        # Synthetic PSF parameters
+        row_psf_params = QHBoxLayout()
+        row_psf_params.addWidget(QLabel("NA:"))
+        self.na_spin = QDoubleSpinBox()
+        self.na_spin.setRange(0.1, 1.7)
+        self.na_spin.setValue(1.4)
+        self.na_spin.setDecimals(2)
+        self.na_spin.setSingleStep(0.05)
+        self.na_spin.setEnabled(False)
+        row_psf_params.addWidget(self.na_spin)
+        row_psf_params.addWidget(QLabel("λ (nm):"))
+        self.wavelength_spin = QDoubleSpinBox()
+        self.wavelength_spin.setRange(300, 800)
+        self.wavelength_spin.setValue(520.0)
+        self.wavelength_spin.setDecimals(0)
+        self.wavelength_spin.setEnabled(False)
+        row_psf_params.addWidget(self.wavelength_spin)
+        fl.addLayout(row_psf_params)
+        self.deconv_check.toggled.connect(self.na_spin.setEnabled)
+        self.deconv_check.toggled.connect(self.wavelength_spin.setEnabled)
+
+        # PSF file path (shown only when "Load from file" is selected)
+        row_psf_file = QHBoxLayout()
+        row_psf_file.addWidget(QLabel("PSF File:"))
+        self.psf_path_edit = QLineEdit()
+        self.psf_path_edit.setPlaceholderText("Path to measured PSF TIFF")
+        self.psf_path_edit.setEnabled(False)
+        row_psf_file.addWidget(self.psf_path_edit)
+        self.psf_browse_btn = QPushButton("Browse")
+        self.psf_browse_btn.setEnabled(False)
+        self.psf_browse_btn.clicked.connect(self._on_browse_psf)
+        row_psf_file.addWidget(self.psf_browse_btn)
+        fl.addLayout(row_psf_file)
+
+        def _toggle_psf_source(idx):
+            is_file = (idx == 1)
+            is_on = self.deconv_check.isChecked()
+            self.psf_path_edit.setEnabled(is_file and is_on)
+            self.psf_browse_btn.setEnabled(is_file and is_on)
+            self.na_spin.setEnabled(not is_file and is_on)
+            self.wavelength_spin.setEnabled(not is_file and is_on)
+        self.psf_source_combo.currentIndexChanged.connect(_toggle_psf_source)
 
         grp_feat.setLayout(fl)
         layout.addWidget(grp_feat)
@@ -350,10 +481,53 @@ class ColocWidget(QWidget):
         self.reset_btn.clicked.connect(self._on_reset)
         layout.addWidget(self.reset_btn)
 
+        # --- Collapsible sections ---
+        self._collapse_btns = {}
+        for grp, collapsed in [
+            (grp_session, False),
+            (grp_feat,    False),
+            (grp_labels,  True),
+            (grp_export,  True),
+            (grp_nav,     False),
+            (grp_log,     False),
+            (grp_record,  True),
+        ]:
+            self._make_collapsible(grp, layout, collapsed)
+
         # Finalise scroll area
         layout.addStretch()
         scroll.setWidget(inner)
         outer.addWidget(scroll)
+
+    # ----------------------------------------------------------------
+    #  COLLAPSIBLE HELPER
+    # ----------------------------------------------------------------
+    def _make_collapsible(self, grp, parent_layout, collapsed=False):
+        """Insert a flat toggle button before *grp* that hides/shows it."""
+        title = grp.title()
+        arrow = "\u25B6" if collapsed else "\u25BC"  # ▶ / ▼
+        btn = QPushButton(f"{arrow}  {title}")
+        btn.setFlat(True)
+        btn.setStyleSheet(
+            "text-align: left; font-weight: bold; padding: 3px 6px;"
+            "color: palette(text);")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setFocusPolicy(Qt.NoFocus)
+
+        idx = parent_layout.indexOf(grp)
+        parent_layout.insertWidget(idx, btn)
+
+        grp.setTitle("")            # title now lives on the button
+        grp.setFlat(True)           # remove the box frame for a cleaner look
+        grp.setVisible(not collapsed)
+
+        def _toggle():
+            vis = not grp.isVisible()
+            grp.setVisible(vis)
+            btn.setText(f"{'\u25BC' if vis else '\u25B6'}  {title}")
+
+        btn.clicked.connect(_toggle)
+        self._collapse_btns[grp] = btn
 
     def _update_sb_preview(self, _=None):
         """Refresh the scale bar pixel-width preview label."""
@@ -387,6 +561,9 @@ class ColocWidget(QWidget):
         # Setup sections: editable only when unconfigured
         for w in (self.grp_session, self.grp_feat, self.grp_labels, self.grp_export):
             w.setEnabled(is_unconfigured or is_finalized)
+            # Keep collapse toggle clickable regardless of state
+            if w in self._collapse_btns:
+                self._collapse_btns[w].setEnabled(True)
 
         self.load_btn.setEnabled(is_unconfigured or is_finalized)
         self.load_record_btn.setEnabled(is_unconfigured or is_finalized)
@@ -414,6 +591,12 @@ class ColocWidget(QWidget):
         if folder:
             self.input_dir_edit.setText(folder)
 
+    def _on_browse_psf(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select PSF TIFF", "", "TIFF files (*.tif *.tiff);;All files (*)")
+        if path:
+            self.psf_path_edit.setText(path)
+
     # ----------------------------------------------------------------
     #  LOAD EXPERIMENT
     # ----------------------------------------------------------------
@@ -440,6 +623,19 @@ class ColocWidget(QWidget):
         px_val = self.px_size_spin.value()
         pixel_size_um = px_val if px_val > 0 else None
 
+        # Map combo display names to internal keys
+        _denoise_methods = {
+            "Wavelet": "wavelet", "Non-Local Means": "nlm",
+            "Total Variation": "tv", "Median": "median",
+            "Gaussian": "gaussian", "Bilateral": "bilateral",
+        }
+        _deconv_methods = {
+            "Richardson-Lucy": "richardson_lucy",
+            "Wiener": "wiener",
+            "Unsupervised Wiener": "unsupervised_wiener",
+        }
+        _psf_sources = {"Synthetic": "synthetic", "Load from file": "file"}
+
         # Build SessionConfig from widget values
         self.cfg = SessionConfig(
             input_dir=input_dir,
@@ -464,6 +660,19 @@ class ColocWidget(QWidget):
             sb_len_mm=self.sb_spin.value(),
             sb_um=self.sb_um_spin.value(),
             pixel_size_um=pixel_size_um,
+            do_denoise=self.denoise_check.isChecked(),
+            denoise_method=_denoise_methods.get(
+                self.denoise_method_combo.currentText(), "wavelet"),
+            denoise_strength=self.denoise_strength_spin.value(),
+            do_deconvolve=self.deconv_check.isChecked(),
+            deconv_method=_deconv_methods.get(
+                self.deconv_method_combo.currentText(), "richardson_lucy"),
+            deconv_iterations=self.deconv_iter_spin.value(),
+            psf_source=_psf_sources.get(
+                self.psf_source_combo.currentText(), "synthetic"),
+            psf_path=self.psf_path_edit.text().strip() or None,
+            na=self.na_spin.value(),
+            wavelength_nm=self.wavelength_spin.value(),
         )
         self.fig_builder = FigureBuilder(self.cfg)
 
@@ -623,6 +832,41 @@ class ColocWidget(QWidget):
             raw_crop_m  = safe_crop(img_m,  y1, y2, x1, x2)
             raw_crop_bf = safe_crop(img_bf, y1, y2, x1, x2)
 
+            # --- DENOISE (before deconvolution) ---
+            if self.cfg.do_denoise:
+                meth = self.cfg.denoise_method
+                stren = self.cfg.denoise_strength
+                self._log(f"   >> DENOISE: {meth} (strength={stren})")
+                if raw_crop_c is not None:
+                    raw_crop_c = denoise_image(raw_crop_c, meth, strength=stren)
+                if raw_crop_g is not None:
+                    raw_crop_g = denoise_image(raw_crop_g, meth, strength=stren)
+                if raw_crop_m is not None:
+                    raw_crop_m = denoise_image(raw_crop_m, meth, strength=stren)
+
+            # --- DECONVOLUTION (after denoise) ---
+            psf = None
+            if self.cfg.do_deconvolve:
+                if self.cfg.psf_source == "file" and self.cfg.psf_path:
+                    psf = load_psf(self.cfg.psf_path)
+                    self._log(f"   >> PSF loaded from file: {self.cfg.psf_path}")
+                else:
+                    psf = generate_gaussian_psf(
+                        self.cfg.na, self.cfg.wavelength_nm,
+                        self.cfg.pixel_size_um)
+                    self._log(f"   >> Synthetic PSF (NA={self.cfg.na}, "
+                              f"λ={self.cfg.wavelength_nm}nm)")
+
+                dm = self.cfg.deconv_method
+                nit = self.cfg.deconv_iterations
+                self._log(f"   >> DECONVOLVE: {dm} ({nit} iter)")
+                if raw_crop_c is not None:
+                    raw_crop_c = deconvolve_image(raw_crop_c, psf, dm, num_iter=nit)
+                if raw_crop_g is not None:
+                    raw_crop_g = deconvolve_image(raw_crop_g, psf, dm, num_iter=nit)
+                if raw_crop_m is not None:
+                    raw_crop_m = deconvolve_image(raw_crop_m, psf, dm, num_iter=nit)
+
             h, w = self.cfg.crop_h, self.cfg.crop_w
 
             def ensure_shape(arr):
@@ -647,9 +891,16 @@ class ColocWidget(QWidget):
             else:
                 self._log("   >> Visuals only")
 
-            lim_c  = auto_contrast_limits(raw_crop_c)
-            lim_g  = auto_contrast_limits(raw_crop_g)
-            lim_m  = auto_contrast_limits(raw_crop_m)
+            # --- CONTRAST LIMITS (unified when denoise/deconv active) ---
+            if self.cfg.do_denoise or self.cfg.do_deconvolve:
+                shared_lim = unified_contrast_limits(
+                    raw_crop_c, raw_crop_g, raw_crop_m)
+                lim_c = lim_g = lim_m = shared_lim
+                self._log(f"   >> UNIFIED CONTRAST: {shared_lim}")
+            else:
+                lim_c = auto_contrast_limits(raw_crop_c)
+                lim_g = auto_contrast_limits(raw_crop_g)
+                lim_m = auto_contrast_limits(raw_crop_m)
             lim_bf = auto_contrast_limits(raw_crop_bf)
 
             norm_c  = ensure_shape(auto_contrast(raw_crop_c, limits=lim_c))
@@ -680,6 +931,14 @@ class ColocWidget(QWidget):
                     crop = safe_crop(img_data, zy1, zy2, zx1, zx2)
                     if crop is None or crop.shape != (zs, zs):
                         return None
+                    if self.cfg.do_denoise:
+                        crop = denoise_image(
+                            crop, self.cfg.denoise_method,
+                            strength=self.cfg.denoise_strength)
+                    if self.cfg.do_deconvolve and psf is not None:
+                        crop = deconvolve_image(
+                            crop, psf, self.cfg.deconv_method,
+                            num_iter=self.cfg.deconv_iterations)
                     upscaled = upscale_channel(crop, target_px, target_px)
                     return auto_contrast(upscaled, limits=limits)
 
@@ -871,6 +1130,17 @@ class ColocWidget(QWidget):
             'font_size':    self.font_spin.value(),
             'sb_um':        self.sb_um_spin.value(),
             'sb_len_mm':    self.sb_spin.value(),
+            # Denoise / Deconvolution
+            'do_denoise':       self.denoise_check.isChecked(),
+            'denoise_method':   self.denoise_method_combo.currentText(),
+            'denoise_strength': self.denoise_strength_spin.value(),
+            'do_deconvolve':    self.deconv_check.isChecked(),
+            'deconv_method':    self.deconv_method_combo.currentText(),
+            'deconv_iterations': self.deconv_iter_spin.value(),
+            'psf_source':       self.psf_source_combo.currentText(),
+            'psf_path':         self.psf_path_edit.text(),
+            'na':               self.na_spin.value(),
+            'wavelength_nm':    self.wavelength_spin.value(),
         }
         try:
             with open(self._SETTINGS_PATH, 'w') as f:
@@ -910,6 +1180,23 @@ class ColocWidget(QWidget):
         if 'font_size' in d:     self.font_spin.setValue(d['font_size'])
         if 'sb_um' in d:         self.sb_um_spin.setValue(d['sb_um'])
         if 'sb_len_mm' in d:     self.sb_spin.setValue(d['sb_len_mm'])
+        # Denoise / Deconvolution
+        if 'do_denoise' in d:       self.denoise_check.setChecked(d['do_denoise'])
+        if d.get('denoise_method'):
+            idx = self.denoise_method_combo.findText(d['denoise_method'])
+            if idx >= 0: self.denoise_method_combo.setCurrentIndex(idx)
+        if 'denoise_strength' in d: self.denoise_strength_spin.setValue(d['denoise_strength'])
+        if 'do_deconvolve' in d:    self.deconv_check.setChecked(d['do_deconvolve'])
+        if d.get('deconv_method'):
+            idx = self.deconv_method_combo.findText(d['deconv_method'])
+            if idx >= 0: self.deconv_method_combo.setCurrentIndex(idx)
+        if 'deconv_iterations' in d: self.deconv_iter_spin.setValue(d['deconv_iterations'])
+        if d.get('psf_source'):
+            idx = self.psf_source_combo.findText(d['psf_source'])
+            if idx >= 0: self.psf_source_combo.setCurrentIndex(idx)
+        if d.get('psf_path'):       self.psf_path_edit.setText(d['psf_path'])
+        if 'na' in d:               self.na_spin.setValue(d['na'])
+        if 'wavelength_nm' in d:    self.wavelength_spin.setValue(d['wavelength_nm'])
 
     # ----------------------------------------------------------------
     #  FINALIZE

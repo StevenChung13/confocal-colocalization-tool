@@ -5,6 +5,7 @@ tifffile>=2023.1.1
 matplotlib>=3.7
 scikit-image>=0.21
 scipy>=1.11
+PyWavelets>=1.4
 PyQt5>=5.15
 imagecodecs>=2024.1.1
 Pillow>=10.0
