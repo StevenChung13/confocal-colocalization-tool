@@ -1,7 +1,7 @@
 # Confocal Colocalization Tool
 
 An interactive, semi-automated tool for **fluorescence colocalization analysis** of multi-channel confocal microscopy images.  
-Built on [Napari](https://napari.org/), it lets you visually select regions of interest, crop them, apply pseudocolour overlays, draw intensity line profiles, and compute **Pearson's R** and **Manders' coefficients** — all with publication-ready PDF/PNG panel output fully compatible with **Adobe Illustrator**.
+Built on [Napari](https://napari.org/), it lets you visually select regions of interest, crop them, apply pseudocolour overlays, selectively include/exclude fluorescence channels, draw intensity line profiles, and compute **Pearson's R** and **Manders' coefficients** — all with publication-ready PDF/PNG panel output fully compatible with **Adobe Illustrator**.
 
 ---
 
@@ -12,10 +12,12 @@ Built on [Napari](https://napari.org/), it lets you visually select regions of i
 | **Interactive ROI selection** | Drag a yellow box in Napari to select your region of interest |
 | **Zoom panel** | Optional cyan box to define an enlarged inset with bicubic upscaling |
 | **Dual / Triple channel** | Automatically detects 2- or 3-fluorescence-channel datasets |
+| **Selectable fluorescence channels** | Include/exclude Cyan, Green, and Magenta per session; excluded channels are removed from panel/montage columns, merged view, and intensity profiles |
 | **Brightfield support** | Optional BF overlay panel (true-colour RGB) |
 | **Fluorescent intensity line profile** | Draw a line in Napari; normalised intensity CSV and integrated plot panel are generated automatically |
 | **Colocalization quantification** | Pearson R and Manders M1/M2 with **Maximum Entropy** (Kapur) thresholding |
 | **Publication-ready output** | PDF panels with `interpolation='none'`, Type 42 vector fonts, configurable print size (mm) — optimised for Adobe Illustrator |
+| **Live title/scale-bar preview** | Export settings include an inline preview plus a larger **Open Preview** window before processing |
 | **Summary montage** | Auto-assembled multi-row montage PDF + PNG including intensity profile column |
 | **Date folder organisation** | Group experiments by date (`YYYYMMDD`) for cleaner project structure |
 | **Session record (pickle)** | Save your entire session (settings + processed data) to a `.pkl` file; reload later to change labels, font, layout — no reprocessing needed |
@@ -91,8 +93,8 @@ Confocal_Workflow/
         │   │   ├── Panel_View.pdf
         │   │   ├── Panel_View.png
         │   │   └── QC_Masks/
-        │   │       ├── Mask_Green_MaxEnt.tif
-        │   │       └── Mask_Mag_MaxEnt.tif
+        │   │       ├── Mask_Green_MaxEntropy.tif
+        │   │       └── Mask_Mag_MaxEntropy.tif
         │   ├── <Experiment>_SUMMARY_MONTAGE.pdf
         │   ├── <Experiment>_SUMMARY_MONTAGE.png
         │   ├── <Experiment>_QUANTIFICATION.csv
@@ -140,10 +142,11 @@ Fill in the settings in the dock widget:
 | **Zoom / Enlargement** | You want a magnified inset (set magnification, e.g. 3×) |
 | **Intensity Line Profile** | You want a fluorescence intensity plot across a structure |
 | **Quantification** | You want Pearson R and Manders M1/M2 (enabled by default) |
+| **Cyan / Green / Magenta** (Fluorescence Channels to Include) | Keep only channels you want to show in outputs (at least one must remain selected) |
 
 ### 5. Set channel labels
 
-Enter the names of your fluorescent proteins / dyes (e.g. "ATG5", "LC3B-GFP", "LAMP1-mCherry"). These appear on every panel and montage.
+Enter the names of your fluorescent proteins / dyes (e.g. "ATG5", "LC3B-GFP", "LAMP1-mCherry"). These appear on every panel and montage for the channels you selected.
 
 ### 6. Adjust export settings
 
@@ -153,6 +156,7 @@ Enter the names of your fluorescent proteins / dyes (e.g. "ATG5", "LC3B-GFP", "L
 | **Font Size (pt)** | 5–7 pt for most journals |
 | **Scale Bar (µm)** | 10 µm is typical for cell biology |
 | **Pixel Size (µm/px)** | Auto-detected from Leica XML metadata; adjust manually if needed |
+| **Preview area / Open Preview** | Use this to check title placement and scale-bar appearance before loading or processing images |
 
 ### 7. Click **LOAD EXPERIMENT**
 
@@ -193,7 +197,7 @@ Your outputs are in `Output_Coloc/<DateFolder>/<ExperimentName>/`. Open the PDFs
 
 ## Reloading a Session Record (Change Labels / Settings Without Reprocessing)
 
-This is the key time-saving feature. If you need to change channel labels, font size, panel width, or spacing **after** you have already processed and finalized:
+This is the key time-saving feature. If you need to change included channels, channel labels, font size, panel width, or spacing **after** you have already processed and finalized:
 
 ### Step-by-step
 
@@ -202,6 +206,7 @@ This is the key time-saving feature. If you need to change channel labels, font 
 3. In the file dialog, navigate to your experiment folder and select the `*_session_record.pkl` file
 4. The plugin populates **all settings** from the saved session — labels, font, spacing, etc.
 5. **Edit whatever you want** in the dock widget:
+    - Include/exclude Cyan, Green, and Magenta channels
    - Change channel labels (e.g. rename "Protein-GFP" → "LC3B")
    - Adjust font size or panel width
    - Change spacing
@@ -263,6 +268,11 @@ This gives you a single overview of all experiments done on that date.
 | `Panel_View.pdf` | Vector PDF panel — Illustrator-ready (`interpolation='none'`, Type 42 fonts) |
 | `Panel_View.png` | Raster PNG at calculated DPI |
 | `QC_Masks/` | Maximum Entropy threshold binary masks for QC |
+
+Notes:
+
+- If a fluorescence channel is excluded, its standalone TIFF, merge contribution, and intensity-profile column are omitted.
+- At least one fluorescence channel (Cyan/Green/Magenta) must be selected to start loading an experiment.
 
 ### Per-experiment
 
@@ -349,6 +359,7 @@ All PDF output is optimised for Adobe Illustrator:
 | Problem | Solution |
 |---|---|
 | Yellow box is missing or won't move | Make sure the **1_MAIN_CROP** layer is selected (click it in the layer list). Use the **pointer tool** (arrow icon, top left of Napari), not the drawing tool. |
+| `ERROR: Select at least one fluorescence channel (Cyan/Green/Magenta).` | In **Fluorescence Channels to Include**, re-enable at least one channel before clicking **LOAD EXPERIMENT**. |
 | Accidentally drew extra shapes | The shape layer sanitiser automatically removes extra vertices. If you still see unexpected shapes, select the layer → press **A** (select all) → **Delete**, then re-draw. |
 | Zoom box appears outside the yellow crop box | The zoom inset must be **inside** the yellow box. If placed outside, the zoom panel will show the wrong region. Drag the cyan box to be fully contained within the yellow box. |
 | Intensity line profile is flat | The line must cross a region with fluorescent signal. If drawn over background, the profile will be flat. Redraw across a bright structure. |
