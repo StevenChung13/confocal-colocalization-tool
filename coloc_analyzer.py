@@ -924,9 +924,9 @@ class ColocManager:
             qc_path = os.path.join(save_path, "QC_Masks")
             os.makedirs(qc_path, exist_ok=True)
             tifffile.imwrite(
-                os.path.join(qc_path, "Mask_Green_Otsu.tif"), to_uint8(mask_g))
+                os.path.join(qc_path, "Mask_Green_MaxEntropy.tif"), to_uint8(mask_g))
             tifffile.imwrite(
-                os.path.join(qc_path, "Mask_Mag_Otsu.tif"),   to_uint8(mask_m))
+                os.path.join(qc_path, "Mask_Mag_MaxEntropy.tif"),   to_uint8(mask_m))
 
         plot_list =[]
         if self.mode == "TRIPLE":

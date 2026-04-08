@@ -19,7 +19,8 @@ from qtpy.QtWidgets import (
     QCheckBox, QPushButton, QTextEdit, QFileDialog,
     QScrollArea, QSizePolicy, QProgressBar, QComboBox,
 )
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer
+from qtpy.QtGui import QImage, QPixmap
 from skimage.measure import profile_line
 
 from napari_coloc_analyzer._core import (
@@ -89,6 +90,7 @@ class ColocWidget(QWidget):
         self._load_settings()          # (E) Restore last-used settings
         self._bind_keyboard_shortcuts() # (D) Keyboard shortcuts
         self._set_state(_UNCONFIGURED)
+        QTimer.singleShot(0, self._refresh_preview)
 
     # ----------------------------------------------------------------
     #  UI CONSTRUCTION
@@ -300,7 +302,28 @@ class ColocWidget(QWidget):
         layout.addWidget(grp_feat)
         self.grp_feat = grp_feat
 
-        # 3. CHANNEL LABELS
+        # 3. FLUORESCENCE CHANNEL INCLUSION
+        grp_channels = QGroupBox("Fluorescence Channels to Include")
+        cl = QVBoxLayout()
+        self.include_c_check = QCheckBox("Cyan")
+        self.include_c_check.setChecked(True)
+        cl.addWidget(self.include_c_check)
+        self.include_g_check = QCheckBox("Green")
+        self.include_g_check.setChecked(True)
+        cl.addWidget(self.include_g_check)
+        self.include_m_check = QCheckBox("Magenta")
+        self.include_m_check.setChecked(True)
+        cl.addWidget(self.include_m_check)
+        lbl_channel_hint = QLabel(
+            "Detected channels can be selectively excluded from panels, montage, merge, and intensity profile."
+        )
+        lbl_channel_hint.setWordWrap(True)
+        cl.addWidget(lbl_channel_hint)
+        grp_channels.setLayout(cl)
+        layout.addWidget(grp_channels)
+        self.grp_channels = grp_channels
+
+        # 4. CHANNEL LABELS
         grp_labels = QGroupBox("Channel Labels")
         ll = QVBoxLayout()
 
@@ -315,7 +338,7 @@ class ColocWidget(QWidget):
         layout.addWidget(grp_labels)
         self.grp_labels = grp_labels
 
-        # 4. EXPORT SETTINGS
+        # 5. EXPORT SETTINGS
         grp_export = QGroupBox("Export Settings (Illustrator)")
         el = QVBoxLayout()
 
@@ -372,9 +395,35 @@ class ColocWidget(QWidget):
         row_sb_mm.addWidget(self.sb_px_label)
         el.addLayout(row_sb_mm)
 
+        row_preview = QHBoxLayout()
+        self.preview_btn = QPushButton("Open Preview")
+        self.preview_btn.setToolTip(
+            "Open a larger title/scale bar preview using current export settings.")
+        self.preview_btn.clicked.connect(self._on_open_preview)
+        row_preview.addWidget(self.preview_btn)
+        row_preview.addStretch(1)
+        el.addLayout(row_preview)
+
+        self.preview_label = QLabel("Preview unavailable")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumHeight(150)
+        self.preview_label.setStyleSheet("border: 1px solid #777; background: #111; color: #ddd;")
+        el.addWidget(self.preview_label)
+
         # Connect signals to update the pixel preview label
         self.sb_um_spin.valueChanged.connect(self._update_sb_preview)
         self.px_size_spin.valueChanged.connect(self._update_sb_preview)
+        self.sb_spin.valueChanged.connect(self._refresh_preview)
+        self.panel_w_spin.valueChanged.connect(self._refresh_preview)
+        self.font_spin.valueChanged.connect(self._refresh_preview)
+        self.spacing_spin.valueChanged.connect(self._refresh_preview)
+        self.lbl_c_edit.textChanged.connect(self._refresh_preview)
+        self.lbl_g_edit.textChanged.connect(self._refresh_preview)
+        self.lbl_m_edit.textChanged.connect(self._refresh_preview)
+        self.lbl_merge_edit.textChanged.connect(self._refresh_preview)
+        self.include_c_check.toggled.connect(self._refresh_preview)
+        self.include_g_check.toggled.connect(self._refresh_preview)
+        self.include_m_check.toggled.connect(self._refresh_preview)
         self._update_sb_preview()
 
         grp_export.setLayout(el)
@@ -539,6 +588,101 @@ class ColocWidget(QWidget):
         else:
             self.sb_px_label.setText("(using mm fallback)")
             self.sb_spin.setEnabled(True)
+        self._refresh_preview()
+
+    def _selected_fluor_channels(self):
+        return {
+            'cyan': self.include_c_check.isChecked(),
+            'green': self.include_g_check.isChecked(),
+            'mag': self.include_m_check.isChecked(),
+        }
+
+    def _validate_fluor_selection(self):
+        selected = self._selected_fluor_channels()
+        return any(selected.values())
+
+    def _preview_cfg_from_widgets(self):
+        px_val = self.px_size_spin.value()
+        pixel_size_um = px_val if px_val > 0 else None
+        return SessionConfig(
+            input_dir=self.input_dir_edit.text().strip() or os.path.join(BASE_DIR, "Input_Raw"),
+            date_folder=self.date_folder_edit.text().strip() or None,
+            exp_name=self.exp_name_edit.text().strip() or None,
+            crop_w=self.crop_w_spin.value(),
+            crop_h=self.crop_h_spin.value(),
+            do_bf=self.bf_check.isChecked(),
+            do_zoom=self.zoom_check.isChecked(),
+            zoom_mag=self.zoom_mag_spin.value(),
+            lbl_c=self.lbl_c_edit.text(),
+            lbl_g=self.lbl_g_edit.text(),
+            lbl_m=self.lbl_m_edit.text(),
+            include_c=self.include_c_check.isChecked(),
+            include_g=self.include_g_check.isChecked(),
+            include_m=self.include_m_check.isChecked(),
+            lbl_merge=self.lbl_merge_edit.text(),
+            lbl_zoom=self.lbl_zoom_edit.text() or None,
+            lbl_bf=self.lbl_bf_edit.text(),
+            do_quant=self.quant_check.isChecked(),
+            do_intensity_profile=self.profile_check.isChecked(),
+            panel_w_mm=self.panel_w_spin.value(),
+            spacing_pt=self.spacing_spin.value(),
+            font_size=self.font_spin.value(),
+            sb_len_mm=self.sb_spin.value(),
+            sb_um=self.sb_um_spin.value(),
+            pixel_size_um=pixel_size_um,
+        )
+
+    @staticmethod
+    def _rgb_to_pixmap(rgb):
+        h, w, _ = rgb.shape
+        img = np.ascontiguousarray(rgb)
+        qimg = QImage(img.data, w, h, 3 * w, QImage.Format_RGB888)
+        return QPixmap.fromImage(qimg.copy())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_preview()
+
+    def _refresh_preview(self):
+        try:
+            w, h = self.preview_label.width() - 4, self.preview_label.height() - 4
+            if w <= 0 or h <= 0:
+                return
+
+            cfg = self._preview_cfg_from_widgets()
+            preview_builder = FigureBuilder(cfg)
+            preview_rgb = preview_builder.render_preview_panel(label=self.lbl_merge_edit.text() or cfg.lbl_merge)
+            pixmap = self._rgb_to_pixmap(preview_rgb)
+            scaled = pixmap.scaled(
+                w, h,
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self.preview_label.setPixmap(scaled)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self.preview_label.setText("Preview unavailable")
+
+    def _on_open_preview(self):
+        try:
+            cfg = self._preview_cfg_from_widgets()
+            preview_builder = FigureBuilder(cfg)
+            preview_rgb = preview_builder.render_preview_panel(
+                label=self.lbl_merge_edit.text() or cfg.lbl_merge,
+                log=self._log,
+            )
+            pixmap = self._rgb_to_pixmap(preview_rgb)
+            self._preview_window = QWidget(self)
+            self._preview_window.setWindowTitle("Label && Scale Bar Preview")
+            lay = QVBoxLayout(self._preview_window)
+            lab = QLabel()
+            lab.setAlignment(Qt.AlignCenter)
+            lab.setPixmap(pixmap)
+            lay.addWidget(lab)
+            self._preview_window.resize(min(900, pixmap.width() + 40), min(700, pixmap.height() + 40))
+            self._preview_window.show()
+        except Exception as e:
+            self._log(f"ERROR: Preview failed: {e}")
 
     @staticmethod
     def _label_row(parent_layout, label_text, default):
@@ -559,7 +703,7 @@ class ColocWidget(QWidget):
         is_finalized = (state == _FINALIZED)
 
         # Setup sections: editable only when unconfigured
-        for w in (self.grp_session, self.grp_feat, self.grp_labels, self.grp_export):
+        for w in (self.grp_session, self.grp_feat, self.grp_channels, self.grp_labels, self.grp_export):
             w.setEnabled(is_unconfigured or is_finalized)
             # Keep collapse toggle clickable regardless of state
             if w in self._collapse_btns:
@@ -601,6 +745,10 @@ class ColocWidget(QWidget):
     #  LOAD EXPERIMENT
     # ----------------------------------------------------------------
     def _on_load_experiment(self):
+        if not self._validate_fluor_selection():
+            self._log("ERROR: Select at least one fluorescence channel (Cyan/Green/Magenta).")
+            return
+
         input_dir = self.input_dir_edit.text().strip()
         if not os.path.isdir(input_dir):
             self._log(f"ERROR: Folder not found: {input_dir}")
@@ -649,6 +797,9 @@ class ColocWidget(QWidget):
             lbl_c=self.lbl_c_edit.text(),
             lbl_g=self.lbl_g_edit.text(),
             lbl_m=self.lbl_m_edit.text(),
+            include_c=self.include_c_check.isChecked(),
+            include_g=self.include_g_check.isChecked(),
+            include_m=self.include_m_check.isChecked(),
             lbl_merge=self.lbl_merge_edit.text(),
             lbl_zoom=self.lbl_zoom_edit.text() or None,
             lbl_bf=self.lbl_bf_edit.text(),
@@ -714,17 +865,26 @@ class ColocWidget(QWidget):
         self.map = self.detector.assign_roles(files, log=self._log)
         self.mode = "TRIPLE" if self.map['cyan'] else "DUAL"
 
+        selected = {
+            'cyan': bool(getattr(self.cfg, 'include_c', True)),
+            'green': bool(getattr(self.cfg, 'include_g', True)),
+            'mag': bool(getattr(self.cfg, 'include_m', True)),
+        }
+        for key, label in (('cyan', 'Cyan'), ('green', 'Green'), ('mag', 'Magenta')):
+            if selected[key] and not self.map.get(key):
+                self._log(f"   >> WARNING: {label} selected but not detected in this image; skipping it.")
+
         # Clear existing layers
         self.viewer.layers.select_all()
         self.viewer.layers.remove_selected()
 
-        if self.map['cyan']:
+        if selected['cyan'] and self.map['cyan']:
             self.viewer.add_image(load_flat(self.map['cyan']),
                 name='Cyan_Ch', colormap='cyan', blending='additive')
-        if self.map['green']:
+        if selected['green'] and self.map['green']:
             self.viewer.add_image(load_flat(self.map['green']),
                 name='Green_Ch', colormap='green', blending='additive')
-        if self.map['mag']:
+        if selected['mag'] and self.map['mag']:
             self.viewer.add_image(load_flat(self.map['mag']),
                 name='Mag_Ch', colormap='magenta', blending='additive')
         if self.cfg.do_bf and self.map['bf']:
@@ -908,10 +1068,18 @@ class ColocWidget(QWidget):
             norm_m  = ensure_shape(auto_contrast(raw_crop_m, limits=lim_m))
             norm_bf = ensure_shape(auto_contrast(raw_crop_bf, limits=lim_bf))
 
-            c_rgb     = make_rgb(norm_c, self.cfg.MIX_CYAN)
-            g_rgb     = make_rgb(norm_g, self.cfg.MIX_GREEN)
-            m_rgb     = make_rgb(norm_m, self.cfg.MIX_MAGENTA)
-            merge_rgb = np.clip(c_rgb + g_rgb + m_rgb, 0, 1)
+            include_channels = {
+                'cyan': bool(getattr(self.cfg, 'include_c', True) and self.map.get('cyan')),
+                'green': bool(getattr(self.cfg, 'include_g', True) and self.map.get('green')),
+                'mag': bool(getattr(self.cfg, 'include_m', True) and self.map.get('mag')),
+            }
+
+            c_rgb = make_rgb(norm_c, self.cfg.MIX_CYAN) if include_channels['cyan'] else None
+            g_rgb = make_rgb(norm_g, self.cfg.MIX_GREEN) if include_channels['green'] else None
+            m_rgb = make_rgb(norm_m, self.cfg.MIX_MAGENTA) if include_channels['mag'] else None
+
+            merge_parts = [x for x in (c_rgb, g_rgb, m_rgb) if x is not None]
+            merge_rgb = np.clip(np.sum(merge_parts, axis=0), 0, 1) if len(merge_parts) >= 2 else None
             bf_rgb    = np.clip(np.stack((norm_bf,)*3, axis=-1), 0, 1).astype(np.float32)
 
             zoom_rgb = None
@@ -947,9 +1115,12 @@ class ColocWidget(QWidget):
                 zn_m = zoom_crop_upscale_contrast(img_m, lim_m)
 
                 z_rgb = np.zeros((target_px, target_px, 3))
-                if zn_c is not None: z_rgb += make_rgb(zn_c, self.cfg.MIX_CYAN)
-                if zn_g is not None: z_rgb += make_rgb(zn_g, self.cfg.MIX_GREEN)
-                if zn_m is not None: z_rgb += make_rgb(zn_m, self.cfg.MIX_MAGENTA)
+                if include_channels['cyan'] and zn_c is not None:
+                    z_rgb += make_rgb(zn_c, self.cfg.MIX_CYAN)
+                if include_channels['green'] and zn_g is not None:
+                    z_rgb += make_rgb(zn_g, self.cfg.MIX_GREEN)
+                if include_channels['mag'] and zn_m is not None:
+                    z_rgb += make_rgb(zn_m, self.cfg.MIX_MAGENTA)
 
                 zoom_rgb = np.clip(z_rgb, 0, 1)
                 zoom_coords_in_main = (zy1 - y1, zx1 - x1)
@@ -981,34 +1152,34 @@ class ColocWidget(QWidget):
                     return np.zeros_like(prof)
 
                 prof_dict = {'Distance_px': np.arange(len(_profile(norm_g)))}
-                if self.mode == "TRIPLE":
+                if include_channels['cyan']:
                     prof_dict[self.cfg.lbl_c] = _profile(norm_c)
-                prof_dict[self.cfg.lbl_g] = _profile(norm_g)
-                prof_dict[self.cfg.lbl_m] = _profile(norm_m)
+                if include_channels['green']:
+                    prof_dict[self.cfg.lbl_g] = _profile(norm_g)
+                if include_channels['mag']:
+                    prof_dict[self.cfg.lbl_m] = _profile(norm_m)
 
                 intensity_data = pd.DataFrame(prof_dict)
+                if len(intensity_data.columns) <= 1:
+                    intensity_data = None
+                    self._log("   >> INTENSITY PROFILE skipped (no included fluorescence channels).")
 
                 _raw_profiles = {'distance': prof_dict['Distance_px']}
-                if self.mode == "TRIPLE":
+                if include_channels['cyan'] and self.cfg.lbl_c in prof_dict:
                     _raw_profiles['cyan'] = prof_dict[self.cfg.lbl_c]
-                _raw_profiles['green'] = prof_dict[self.cfg.lbl_g]
-                _raw_profiles['mag'] = prof_dict[self.cfg.lbl_m]
+                if include_channels['green'] and self.cfg.lbl_g in prof_dict:
+                    _raw_profiles['green'] = prof_dict[self.cfg.lbl_g]
+                if include_channels['mag'] and self.cfg.lbl_m in prof_dict:
+                    _raw_profiles['mag'] = prof_dict[self.cfg.lbl_m]
 
-                save_dir = os.path.join(self.cfg.output_dir, self.current_name)
-                os.makedirs(save_dir, exist_ok=True)
-                intensity_data.to_csv(
-                    os.path.join(save_dir, "Intensity_Profile.csv"), index=False)
-                self._log(f"   >> INTENSITY PROFILE saved ({len(intensity_data)} pts)")
+                if intensity_data is not None:
+                    save_dir = os.path.join(self.cfg.output_dir, self.current_name)
+                    os.makedirs(save_dir, exist_ok=True)
+                    intensity_data.to_csv(
+                        os.path.join(save_dir, "Intensity_Profile.csv"), index=False)
+                    self._log(f"   >> INTENSITY PROFILE saved ({len(intensity_data)} pts)")
 
-            self.fig_builder.save_individual_and_local_panel(
-                self.current_name,
-                c_rgb, g_rgb, m_rgb, merge_rgb, bf_rgb,
-                zoom_rgb, zoom_coords_in_main, mask_g, mask_m,
-                mode=self.mode,
-                intensity_data=intensity_data,
-                line_coords_crop=line_coords_crop)
-
-            self.gallery.append({
+            item_record = {
                 'name':        self.current_name,
                 'cyan':        c_rgb,
                 'green':       g_rgb,
@@ -1021,7 +1192,17 @@ class ColocWidget(QWidget):
                 'intensity_data': intensity_data,
                 'line_coords':    line_coords_crop,
                 'raw_profiles':   _raw_profiles if intensity_data is not None else None,
-            })
+                'included_channels': include_channels,
+            }
+
+            self.fig_builder.save_individual_and_local_panel(
+                item_record,
+                mask_g,
+                mask_m,
+                log=self._log,
+            )
+
+            self.gallery.append(item_record)
 
             self.index += 1
             self._load_current_set()
@@ -1083,6 +1264,35 @@ class ColocWidget(QWidget):
         except Exception as e:
             self._log(f"ERROR saving log: {e}")
 
+    def _apply_channel_selection_to_gallery(self):
+        include = {
+            'cyan': bool(getattr(self.cfg, 'include_c', True)),
+            'green': bool(getattr(self.cfg, 'include_g', True)),
+            'mag': bool(getattr(self.cfg, 'include_m', True)),
+        }
+
+        for item in self.gallery:
+            included = {
+                'cyan': include['cyan'] and item.get('cyan') is not None,
+                'green': include['green'] and item.get('green') is not None,
+                'mag': include['mag'] and item.get('mag') is not None,
+            }
+            item['included_channels'] = included
+
+            merge_inputs = [
+                arr for key, arr in (
+                    ('cyan', item.get('cyan')),
+                    ('green', item.get('green')),
+                    ('mag', item.get('mag')),
+                )
+                if included[key] and arr is not None
+            ]
+            item['merge'] = (
+                np.clip(np.sum(merge_inputs, axis=0), 0, 1)
+                if len(merge_inputs) >= 2
+                else None
+            )
+
     # ----------------------------------------------------------------
     #  (D) KEYBOARD SHORTCUTS
     # ----------------------------------------------------------------
@@ -1117,6 +1327,9 @@ class ColocWidget(QWidget):
             'do_bf':        self.bf_check.isChecked(),
             'do_zoom':      self.zoom_check.isChecked(),
             'zoom_mag':     self.zoom_mag_spin.value(),
+            'include_c':    self.include_c_check.isChecked(),
+            'include_g':    self.include_g_check.isChecked(),
+            'include_m':    self.include_m_check.isChecked(),
             'lbl_c':        self.lbl_c_edit.text(),
             'lbl_g':        self.lbl_g_edit.text(),
             'lbl_m':        self.lbl_m_edit.text(),
@@ -1167,6 +1380,9 @@ class ColocWidget(QWidget):
         if 'do_bf' in d:         self.bf_check.setChecked(d['do_bf'])
         if 'do_zoom' in d:       self.zoom_check.setChecked(d['do_zoom'])
         if 'zoom_mag' in d:      self.zoom_mag_spin.setValue(d['zoom_mag'])
+        if 'include_c' in d:     self.include_c_check.setChecked(d['include_c'])
+        if 'include_g' in d:     self.include_g_check.setChecked(d['include_g'])
+        if 'include_m' in d:     self.include_m_check.setChecked(d['include_m'])
         if d.get('lbl_c'):       self.lbl_c_edit.setText(d['lbl_c'])
         if d.get('lbl_g'):       self.lbl_g_edit.setText(d['lbl_g'])
         if d.get('lbl_m'):       self.lbl_m_edit.setText(d['lbl_m'])
@@ -1197,6 +1413,7 @@ class ColocWidget(QWidget):
         if d.get('psf_path'):       self.psf_path_edit.setText(d['psf_path'])
         if 'na' in d:               self.na_spin.setValue(d['na'])
         if 'wavelength_nm' in d:    self.wavelength_spin.setValue(d['wavelength_nm'])
+        self._refresh_preview()
 
     # ----------------------------------------------------------------
     #  FINALIZE
@@ -1205,11 +1422,17 @@ class ColocWidget(QWidget):
         if not self.cfg or not self.gallery:
             self._log("Nothing to finalize — no processed data.")
             return
+        if not self._validate_fluor_selection():
+            self._log("ERROR: Select at least one fluorescence channel (Cyan/Green/Magenta).")
+            return
 
         # --- Sync current UI values back into cfg -----------------------
         self.cfg.lbl_c     = self.lbl_c_edit.text()
         self.cfg.lbl_g     = self.lbl_g_edit.text()
         self.cfg.lbl_m     = self.lbl_m_edit.text()
+        self.cfg.include_c = self.include_c_check.isChecked()
+        self.cfg.include_g = self.include_g_check.isChecked()
+        self.cfg.include_m = self.include_m_check.isChecked()
         self.cfg.lbl_merge = self.lbl_merge_edit.text()
         self.cfg.lbl_zoom  = self.lbl_zoom_edit.text()
         self.cfg.lbl_bf    = self.lbl_bf_edit.text()
@@ -1230,6 +1453,8 @@ class ColocWidget(QWidget):
 
         self.cfg.spacing_pt = self.spacing_spin.value()
         self.cfg.spacing_inch = self.cfg.spacing_pt / 72.0
+
+        self._apply_channel_selection_to_gallery()
 
         # Rebuild FigureBuilder with updated cfg
         self.fig_builder = FigureBuilder(self.cfg)
@@ -1275,12 +1500,16 @@ class ColocWidget(QWidget):
         self.lbl_c_edit.setText(cfg.lbl_c)
         self.lbl_g_edit.setText(cfg.lbl_g)
         self.lbl_m_edit.setText(cfg.lbl_m)
+        self.include_c_check.setChecked(bool(getattr(cfg, 'include_c', True)))
+        self.include_g_check.setChecked(bool(getattr(cfg, 'include_g', True)))
+        self.include_m_check.setChecked(bool(getattr(cfg, 'include_m', True)))
         self.lbl_merge_edit.setText(cfg.lbl_merge)
         self.lbl_zoom_edit.setText(cfg.lbl_zoom)
         self.lbl_bf_edit.setText(cfg.lbl_bf)
         self.panel_w_spin.setValue(cfg.panel_w_mm)
         self.font_spin.setValue(cfg.font_size)
         self.spacing_spin.setValue(cfg.spacing_pt)
+        self._refresh_preview()
 
         self._log(f"Loaded record: {cfg.exp_name} ({len(gallery)} images)")
         self._log("Edit labels / export settings above, then click FINALIZE to regenerate.")
@@ -1313,6 +1542,7 @@ class ColocWidget(QWidget):
         # 3. Reset pixel size (will be re-detected from new folder)
         self.px_size_spin.setValue(0.0)
         self._update_sb_preview()
+        self._refresh_preview()
 
         # 4. Clear UI feedback
         self.nav_label.setText("No experiment loaded")

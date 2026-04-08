@@ -24,6 +24,7 @@ import tifffile
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.font_manager import FontProperties
 from skimage.transform import resize
 from skimage.measure import profile_line
@@ -78,6 +79,9 @@ class SessionConfig:
                  lbl_c="Protein-Cyan",
                  lbl_g="Protein-GFP",
                  lbl_m="Protein-mCherry",
+                 include_c=True,
+                 include_g=True,
+                 include_m=True,
                  lbl_merge="Merged",
                  lbl_zoom=None,
                  lbl_bf="BF",
@@ -122,6 +126,9 @@ class SessionConfig:
         self.lbl_c = lbl_c
         self.lbl_g = lbl_g
         self.lbl_m = lbl_m
+        self.include_c = bool(include_c)
+        self.include_g = bool(include_g)
+        self.include_m = bool(include_m)
         self.lbl_merge = lbl_merge
         self.lbl_zoom = lbl_zoom or (f"{self.zoom_mag}X enlarged" if self.do_zoom else "Enlarged")
         self.lbl_bf = lbl_bf
@@ -812,60 +819,124 @@ class FigureBuilder:
             pos.height,
         ])
 
-    def add_scale_bar_patch(self, ax):
-        x_start = self.cfg.crop_w - self.cfg.sb_px_w - self.cfg.sb_margin
-        y_start = self.cfg.crop_h - self.cfg.sb_margin - self.cfg.sb_px_h
-        ax.add_patch(patches.Rectangle(
-            (x_start, y_start), self.cfg.sb_px_w, self.cfg.sb_px_h,
-            linewidth=0, edgecolor='none', facecolor='white'))
+    def _draw_title(self, ax, label):
+        ax.text(
+            0.03,
+            0.97,
+            label,
+            transform=ax.transAxes,
+            color='white',
+            fontproperties=self.cfg.font_prop,
+            ha='left',
+            va='top',
+            clip_on=True,
+        )
+
+    def _scale_bar_geometry(self):
+        margin = max(1.0, float(self.cfg.sb_margin))
+        margin = min(margin, self.cfg.crop_w / 4.0, self.cfg.crop_h / 4.0)
+
+        max_w = max(1.0, self.cfg.crop_w - (2.0 * margin))
+        max_h = max(1.0, self.cfg.crop_h - (2.0 * margin))
+
+        sb_w = min(float(self.cfg.sb_px_w), max_w)
+        sb_h = min(float(self.cfg.sb_px_h), max_h)
+
+        x_start = self.cfg.crop_w - sb_w - margin
+        y_start = self.cfg.crop_h - sb_h - margin
+        clamped = (
+            not math.isclose(sb_w, float(self.cfg.sb_px_w), rel_tol=1e-9)
+            or not math.isclose(sb_h, float(self.cfg.sb_px_h), rel_tol=1e-9)
+        )
+        return x_start, y_start, sb_w, sb_h, clamped
+
+    def add_scale_bar_patch(self, ax, log=None):
+        x_start, y_start, sb_w, sb_h, clamped = self._scale_bar_geometry()
+        if clamped and log is not None:
+            log("   >> WARNING: Scale bar auto-clamped to stay inside panel bounds.")
+
+        ax.add_patch(
+            patches.Rectangle(
+                (x_start, y_start),
+                sb_w,
+                sb_h,
+                linewidth=0,
+                edgecolor='none',
+                facecolor='white',
+            )
+        )
+
+    def _iter_panel_items(self, item):
+        channels = item.get('included_channels')
+        if channels is None:
+            channels = {
+                'cyan': item.get('cyan') is not None,
+                'green': item.get('green') is not None,
+                'mag': item.get('mag') is not None,
+            }
+        include_c = bool(channels.get('cyan')) and item.get('cyan') is not None
+        include_g = bool(channels.get('green')) and item.get('green') is not None
+        include_m = bool(channels.get('mag')) and item.get('mag') is not None
+
+        if include_c:
+            yield ('cyan', item.get('cyan'), self.cfg.lbl_c)
+        if include_g:
+            yield ('green', item.get('green'), self.cfg.lbl_g)
+        if include_m:
+            yield ('mag', item.get('mag'), self.cfg.lbl_m)
+
+        if item.get('merge') is not None:
+            yield ('merge', item.get('merge'), self.cfg.lbl_merge)
+
+        if item.get('zoom') is not None:
+            yield ('zoom', item.get('zoom'), self.cfg.lbl_zoom)
+
+        if item.get('bf') is not None:
+            yield ('bf', item.get('bf'), self.cfg.lbl_bf)
+
+        idata = item.get('intensity_data')
+        if idata is not None and not idata.empty:
+            yield ('__intensity__', None, '__intensity__')
 
     # ----- individual panel -----
-    def save_individual_and_local_panel(self, name, c, g, m, merge, bf,
-                                        zoom, zoom_coords, mask_g, mask_m,
-                                        mode="DUAL",
-                                        intensity_data=None,
-                                        line_coords_crop=None):
+    def save_individual_and_local_panel(self, item, mask_g, mask_m, log=print):
+        name = item['name']
         save_path = os.path.join(self.cfg.output_dir, name)
         os.makedirs(save_path, exist_ok=True)
 
         def to_uint8(arr):
             return (arr * 255).astype(np.uint8)
 
-        if mode == "TRIPLE":
-            tifffile.imwrite(os.path.join(save_path, "1_Cyan.tif"), to_uint8(c))
-        tifffile.imwrite(os.path.join(save_path, "2_Green.tif"), to_uint8(g))
-        tifffile.imwrite(os.path.join(save_path, "3_Magenta.tif"), to_uint8(m))
-        tifffile.imwrite(os.path.join(save_path, "4_Merge.tif"), to_uint8(merge))
-        if zoom is not None:
-            tifffile.imwrite(os.path.join(save_path, "5_Zoom.tif"), to_uint8(zoom))
-        if self.cfg.do_bf:
-            tifffile.imwrite(os.path.join(save_path, "6_BF.tif"), to_uint8(bf))
+        tiff_exports = [
+            ('cyan', '1_Cyan.tif'),
+            ('green', '2_Green.tif'),
+            ('mag', '3_Magenta.tif'),
+            ('merge', '4_Merge.tif'),
+            ('zoom', '5_Zoom.tif'),
+            ('bf', '6_BF.tif'),
+        ]
+        for key, file_name in tiff_exports:
+            img_data = item.get(key)
+            if img_data is not None:
+                tifffile.imwrite(os.path.join(save_path, file_name), to_uint8(img_data))
 
         if mask_g is not None and mask_m is not None:
             qc_path = os.path.join(save_path, "QC_Masks")
             os.makedirs(qc_path, exist_ok=True)
             tifffile.imwrite(
-                os.path.join(qc_path, "Mask_Green_Otsu.tif"), to_uint8(mask_g))
+                os.path.join(qc_path, "Mask_Green_MaxEntropy.tif"), to_uint8(mask_g))
             tifffile.imwrite(
-                os.path.join(qc_path, "Mask_Mag_Otsu.tif"), to_uint8(mask_m))
+                os.path.join(qc_path, "Mask_Mag_MaxEntropy.tif"), to_uint8(mask_m))
 
-        plot_list = []
-        if mode == "TRIPLE":
-            plot_list.append((c, self.cfg.lbl_c))
-        plot_list.append((g, self.cfg.lbl_g))
-        plot_list.append((m, self.cfg.lbl_m))
-        plot_list.append((merge, self.cfg.lbl_merge))
-        if zoom is not None:
-            plot_list.append((zoom, self.cfg.lbl_zoom))
-        if self.cfg.do_bf:
-            plot_list.append((bf, self.cfg.lbl_bf))
+        plot_list = list(self._iter_panel_items(item))
+        if not plot_list:
+            log(f"   >> WARNING: No panels available for {name}; skipping panel export.")
+            return
 
-        has_profile = (intensity_data is not None and not intensity_data.empty)
-        if has_profile:
-            plot_list.append((None, '__intensity__'))
+        overlay_target = next((k for k, _, _ in plot_list if k == 'merge'), plot_list[0][0])
 
         n_cols = len(plot_list)
-        col_labels = [lbl for _, lbl in plot_list]
+        col_labels = [lbl for _, _, lbl in plot_list]
         col_w = self._col_widths_inch(col_labels)
 
         total_w = sum(col_w) + (n_cols - 1) * self.cfg.spacing_inch
@@ -876,35 +947,61 @@ class FigureBuilder:
         axes = axes_grid[0]
 
         for i, ax in enumerate(axes):
-            img_data, label = plot_list[i]
+            key, img_data, label = plot_list[i]
 
             if label == '__intensity__':
-                self._render_intensity_axes(ax, intensity_data, mode=mode,
+                self._render_intensity_axes(
+                    ax,
+                    item.get('intensity_data'),
+                    mode=item.get('mode', 'DUAL'),
                                             linewidth=0.8, tick_scale=1.0)
                 continue
 
             ax.imshow(img_data, aspect='auto', interpolation='none')
             ax.axis('off')
-            ax.text(0.05, 0.95, label, transform=ax.transAxes, color='white',
-                    fontproperties=self.cfg.font_prop, ha='left', va='top')
+            self._draw_title(ax, label)
             if i == 0:
-                self.add_scale_bar_patch(ax)
+                self.add_scale_bar_patch(ax, log=log)
 
-            if label == self.cfg.lbl_merge:
-                if zoom_coords is not None:
-                    ry, rx = zoom_coords
+            if key == overlay_target:
+                if item.get('zoom_coords') is not None:
+                    ry, rx = item['zoom_coords']
                     ax.add_patch(patches.Rectangle(
                         (rx, ry), self.cfg.zoom_size, self.cfg.zoom_size,
                         linewidth=1, edgecolor='white',
                         facecolor='none', linestyle='--'))
-                if line_coords_crop is not None:
-                    (ly0, lx0), (ly1, lx1) = line_coords_crop
+                if item.get('line_coords') is not None:
+                    (ly0, lx0), (ly1, lx1) = item['line_coords']
                     ax.plot([lx0, lx1], [ly0, ly1],
                             color='white', linewidth=0.8, linestyle='--')
 
         plt.savefig(os.path.join(save_path, "Panel_View.pdf"), dpi=self.cfg.dpi)
         plt.savefig(os.path.join(save_path, "Panel_View.png"), dpi=self.cfg.dpi)
         plt.close(fig)
+
+    def render_preview_panel(self, image_rgb=None, label=None, log=None):
+        if image_rgb is None:
+            h, w = self.cfg.crop_h, self.cfg.crop_w
+            image_rgb = np.zeros((h, w, 3), dtype=np.float32)
+            grid_step = max(16, w // 18)
+            for y in range(0, h, grid_step):
+                image_rgb[y:y + 1, :, :] = 0.2
+            for x in range(0, w, grid_step):
+                image_rgb[:, x:x + 1, :] = 0.2
+
+        fig = plt.figure(figsize=(self.cfg.panel_w_inch, self.cfg.panel_h_inch))
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.imshow(image_rgb, aspect='auto', interpolation='none')
+        ax.axis('off')
+        self._draw_title(ax, label or self.cfg.lbl_merge)
+        self.add_scale_bar_patch(ax, log=log)
+
+        canvas.draw()
+        rgba = np.asarray(canvas.buffer_rgba())
+        rgb = rgba[..., :3].copy()
+        plt.close(fig)
+        return rgb
 
     # ----- finalisation -----
     def finalize_analysis(self, gallery, stats_log, log=print):
@@ -929,22 +1026,7 @@ class FigureBuilder:
     # ----- regeneration helpers -----
     def regenerate_all_panels(self, gallery, log=print):
         for item in gallery:
-            name = item['name']
-            mode = item['mode']
-            self.save_individual_and_local_panel(
-                name,
-                item['cyan'],
-                item['green'],
-                item['mag'],
-                item['merge'],
-                item.get('bf'),
-                item.get('zoom'),
-                item.get('zoom_coords'),
-                None, None,
-                mode=mode,
-                intensity_data=item.get('intensity_data'),
-                line_coords_crop=item.get('line_coords'),
-            )
+            self.save_individual_and_local_panel(item, None, None, log=log)
         log(f"   >> {len(gallery)} panel view(s) regenerated.")
 
     def regenerate_intensity_csvs(self, gallery, log=print):
@@ -953,15 +1035,18 @@ class FigureBuilder:
             if raw is None:
                 continue
             new_dict = {'Distance_px': raw['distance']}
-            if 'cyan' in raw:
+            if 'cyan' in raw and bool(getattr(self.cfg, 'include_c', True)):
                 new_dict[self.cfg.lbl_c] = raw['cyan']
-            new_dict[self.cfg.lbl_g] = raw['green']
-            new_dict[self.cfg.lbl_m] = raw['mag']
+            if 'green' in raw and bool(getattr(self.cfg, 'include_g', True)):
+                new_dict[self.cfg.lbl_g] = raw['green']
+            if 'mag' in raw and bool(getattr(self.cfg, 'include_m', True)):
+                new_dict[self.cfg.lbl_m] = raw['mag']
             new_df = pd.DataFrame(new_dict)
-            item['intensity_data'] = new_df
+            item['intensity_data'] = new_df if len(new_df.columns) > 1 else None
             save_dir = os.path.join(self.cfg.output_dir, item['name'])
-            new_df.to_csv(
-                os.path.join(save_dir, "Intensity_Profile.csv"), index=False)
+            if item['intensity_data'] is not None:
+                new_df.to_csv(
+                    os.path.join(save_dir, "Intensity_Profile.csv"), index=False)
         if any(item.get('raw_profiles') for item in gallery):
             log("   >> Intensity CSVs updated with new labels.")
 
@@ -969,71 +1054,63 @@ class FigureBuilder:
     def build_global_montage(self, gallery, log=print):
         log(">>> GENERATING SUMMARY MONTAGES (PDF + PNG)...")
 
-        n_rows = len(gallery)
-        has_cyan = any(x['mode'] == "TRIPLE" for x in gallery)
-        has_zoom = any(x['zoom'] is not None for x in gallery)
-        has_intensity = any(x.get('intensity_data') is not None for x in gallery)
+        rows = []
+        row_widths = []
+        max_cols = 0
+        for item in gallery:
+            panels = list(self._iter_panel_items(item))
+            if not panels:
+                continue
+            overlay_target = next((k for k, _, _ in panels if k == 'merge'), panels[0][0])
+            labels = [lbl for _, _, lbl in panels]
+            widths = self._col_widths_inch(labels)
+            rows.append((item, panels, widths, overlay_target))
+            row_widths.append(
+                sum(widths) + (len(widths) - 1) * self.cfg.spacing_inch
+            )
+            max_cols = max(max_cols, len(widths))
 
-        col_keys = []
-        col_labels = []
-        if has_cyan:
-            col_keys.append('cyan');  col_labels.append(self.cfg.lbl_c)
-        col_keys.append('green');     col_labels.append(self.cfg.lbl_g)
-        col_keys.append('mag');       col_labels.append(self.cfg.lbl_m)
-        col_keys.append('merge');     col_labels.append(self.cfg.lbl_merge)
-        if has_zoom:
-            col_keys.append('zoom');  col_labels.append(self.cfg.lbl_zoom)
-        if self.cfg.do_bf:
-            col_keys.append('bf');    col_labels.append(self.cfg.lbl_bf)
-        if has_intensity:
-            col_keys.append('__intensity__'); col_labels.append('__intensity__')
+        if not rows:
+            log(">> WARNING: No montage rows to render; skipping summary montage.")
+            return
 
-        n_cols = len(col_keys)
-        col_w = self._col_widths_inch(col_labels)
-        total_w = sum(col_w) + (n_cols - 1) * self.cfg.spacing_inch
+        total_w = max(row_widths)
+        n_rows = len(rows)
         total_h = (n_rows * self.cfg.panel_h_inch +
                    (n_rows - 1) * self.cfg.spacing_inch)
 
         fig = plt.figure(figsize=(total_w, total_h))
-        axes = self._make_axes_grid(fig, n_rows, n_cols, col_w, total_w, total_h)
 
-        h, w = self.cfg.crop_h, self.cfg.crop_w
-        black_main = np.zeros((h, w, 3))
-        zup = self.cfg.zoom_upscaled_size if self.cfg.zoom_upscaled_size > 0 else h
-        black_zoom = np.zeros((zup, zup, 3))
+        for r, (item, panels, widths, overlay_target) in enumerate(rows):
+            row_top = r * (self.cfg.panel_h_inch + self.cfg.spacing_inch)
+            bottom = 1.0 - (row_top + self.cfg.panel_h_inch) / total_h
+            h_frac = self.cfg.panel_h_inch / total_h
 
-        for r, item in enumerate(gallery):
-            for ci, key in enumerate(col_keys):
-                ax = axes[r][ci]
+            x = 0.0
+            for ci, (key, img_data, label) in enumerate(panels):
+                w_frac = widths[ci] / total_w
+                left = x / total_w
+                ax = fig.add_axes([left, bottom, w_frac, h_frac])
+                x += widths[ci] + self.cfg.spacing_inch
 
                 if key == '__intensity__':
-                    idata = item.get('intensity_data')
-                    if idata is not None and not idata.empty:
-                        self._render_intensity_axes(
-                            ax, idata, mode=item.get('mode', 'DUAL'),
-                            linewidth=0.5, tick_scale=0.7)
-                    else:
-                        ax.set_facecolor('none')
-                        ax.patch.set_alpha(0)
-                        ax.axis('off')
+                    self._render_intensity_axes(
+                        ax,
+                        item.get('intensity_data'),
+                        mode=item.get('mode', 'DUAL'),
+                        linewidth=0.5,
+                        tick_scale=0.7,
+                    )
                     continue
-
-                img_data = item.get(key)
-                if img_data is None:
-                    img_data = black_zoom if key == 'zoom' else black_main
 
                 ax.imshow(img_data, aspect='auto', interpolation='none')
                 ax.axis('off')
-
-                if r == 0:
-                    ax.text(0.05, 0.95, col_labels[ci], transform=ax.transAxes,
-                            color='white', fontproperties=self.cfg.font_prop,
-                            ha='left', va='top')
+                self._draw_title(ax, label)
 
                 if r == 0 and ci == 0:
-                    self.add_scale_bar_patch(ax)
+                    self.add_scale_bar_patch(ax, log=log)
 
-                if key == 'merge':
+                if key == overlay_target:
                     if item.get('zoom_coords') is not None:
                         ry, rx = item['zoom_coords']
                         ax.add_patch(patches.Rectangle(
