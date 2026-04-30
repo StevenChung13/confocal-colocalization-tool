@@ -227,7 +227,7 @@ class XMLMetadataDetector:
             base_dir = os.path.dirname(tif_path)
             filename = os.path.basename(tif_path)
 
-            match = re.search(r'(.*)_ch(\d+)\.tif$', filename, re.IGNORECASE)
+            match = re.search(r'(.*)_ch(\d+).*?\.tif$', filename, re.IGNORECASE)
             if not match:
                 continue
 
@@ -292,7 +292,7 @@ class XMLMetadataDetector:
             base_dir = os.path.dirname(tif_path)
             filename = os.path.basename(tif_path)
 
-            match = re.search(r'(.*)_ch(\d+)\.tif$', filename, re.IGNORECASE)
+            match = re.search(r'(.*)_ch(\d+).*?\.tif$', filename, re.IGNORECASE)
             if not match:
                 continue
 
