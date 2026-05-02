@@ -144,9 +144,11 @@ Fill in the settings in the dock widget:
 | **Quantification** | You want Pearson R and Manders M1/M2 (enabled by default) |
 | **Cyan / Green / Magenta** (Fluorescence Channels to Include) | Keep only channels you want to show in outputs (at least one must remain selected) |
 
-### 5. Set channel labels
+### 5. Set channel and condition labels
 
 Enter the names of your fluorescent proteins / dyes (e.g. "ATG5", "LC3B-GFP", "LAMP1-mCherry"). These appear on every panel and montage for the channels you selected.
+
+You can also enter an optional **Condition** (e.g., "Starved", "Control") which will be rendered in the bottom-left corner of the first panel (and the first column of the gallery montage).
 
 ### 6. Adjust export settings
 
