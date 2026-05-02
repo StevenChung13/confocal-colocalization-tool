@@ -333,6 +333,7 @@ class ColocWidget(QWidget):
         self.lbl_merge_edit = self._label_row(ll, "Merge:", "Merged")
         self.lbl_zoom_edit = self._label_row(ll, "Zoom:", "3X enlarged")
         self.lbl_bf_edit = self._label_row(ll, "BF:", "BF")
+        self.condition_lbl_edit = self._label_row(ll, "Condition (Opt.):", "")
 
         grp_labels.setLayout(ll)
         layout.addWidget(grp_labels)
@@ -421,6 +422,7 @@ class ColocWidget(QWidget):
         self.lbl_g_edit.textChanged.connect(self._refresh_preview)
         self.lbl_m_edit.textChanged.connect(self._refresh_preview)
         self.lbl_merge_edit.textChanged.connect(self._refresh_preview)
+        self.condition_lbl_edit.textChanged.connect(self._refresh_preview)
         self.include_c_check.toggled.connect(self._refresh_preview)
         self.include_g_check.toggled.connect(self._refresh_preview)
         self.include_m_check.toggled.connect(self._refresh_preview)
@@ -622,6 +624,7 @@ class ColocWidget(QWidget):
             lbl_merge=self.lbl_merge_edit.text(),
             lbl_zoom=self.lbl_zoom_edit.text() or None,
             lbl_bf=self.lbl_bf_edit.text(),
+            condition_lbl=self.condition_lbl_edit.text(),
             do_quant=self.quant_check.isChecked(),
             do_intensity_profile=self.profile_check.isChecked(),
             panel_w_mm=self.panel_w_spin.value(),
@@ -803,6 +806,7 @@ class ColocWidget(QWidget):
             lbl_merge=self.lbl_merge_edit.text(),
             lbl_zoom=self.lbl_zoom_edit.text() or None,
             lbl_bf=self.lbl_bf_edit.text(),
+            condition_lbl=self.condition_lbl_edit.text(),
             do_quant=self.quant_check.isChecked(),
             do_intensity_profile=self.profile_check.isChecked(),
             panel_w_mm=self.panel_w_spin.value(),
@@ -1336,6 +1340,7 @@ class ColocWidget(QWidget):
             'lbl_merge':    self.lbl_merge_edit.text(),
             'lbl_zoom':     self.lbl_zoom_edit.text(),
             'lbl_bf':       self.lbl_bf_edit.text(),
+            'condition_lbl':self.condition_lbl_edit.text(),
             'do_quant':     self.quant_check.isChecked(),
             'do_profile':   self.profile_check.isChecked(),
             'panel_w_mm':   self.panel_w_spin.value(),
@@ -1389,6 +1394,7 @@ class ColocWidget(QWidget):
         if d.get('lbl_merge'):   self.lbl_merge_edit.setText(d['lbl_merge'])
         if d.get('lbl_zoom'):    self.lbl_zoom_edit.setText(d['lbl_zoom'])
         if d.get('lbl_bf'):      self.lbl_bf_edit.setText(d['lbl_bf'])
+        if d.get('condition_lbl') is not None: self.condition_lbl_edit.setText(d['condition_lbl'])
         if 'do_quant' in d:      self.quant_check.setChecked(d['do_quant'])
         if 'do_profile' in d:    self.profile_check.setChecked(d['do_profile'])
         if 'panel_w_mm' in d:    self.panel_w_spin.setValue(d['panel_w_mm'])
@@ -1436,6 +1442,7 @@ class ColocWidget(QWidget):
         self.cfg.lbl_merge = self.lbl_merge_edit.text()
         self.cfg.lbl_zoom  = self.lbl_zoom_edit.text()
         self.cfg.lbl_bf    = self.lbl_bf_edit.text()
+        self.cfg.condition_lbl = self.condition_lbl_edit.text()
 
         new_pw = self.panel_w_spin.value()
         if new_pw != self.cfg.panel_w_mm:
@@ -1506,6 +1513,7 @@ class ColocWidget(QWidget):
         self.lbl_merge_edit.setText(cfg.lbl_merge)
         self.lbl_zoom_edit.setText(cfg.lbl_zoom)
         self.lbl_bf_edit.setText(cfg.lbl_bf)
+        self.condition_lbl_edit.setText(getattr(cfg, 'condition_lbl', ''))
         self.panel_w_spin.setValue(cfg.panel_w_mm)
         self.font_spin.setValue(cfg.font_size)
         self.spacing_spin.setValue(cfg.spacing_pt)

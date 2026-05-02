@@ -85,6 +85,7 @@ class SessionConfig:
                  lbl_merge="Merged",
                  lbl_zoom=None,
                  lbl_bf="BF",
+                 condition_lbl="",
                  do_quant=True,
                  do_intensity_profile=False,
                  panel_w_mm=20.0,
@@ -132,6 +133,7 @@ class SessionConfig:
         self.lbl_merge = lbl_merge
         self.lbl_zoom = lbl_zoom or (f"{self.zoom_mag}X enlarged" if self.do_zoom else "Enlarged")
         self.lbl_bf = lbl_bf
+        self.condition_lbl = condition_lbl
 
         self.do_quant = do_quant
         self.do_intensity_profile = do_intensity_profile
@@ -832,6 +834,21 @@ class FigureBuilder:
             clip_on=True,
         )
 
+    def _draw_condition_label(self, ax, label):
+        if not label:
+            return
+        ax.text(
+            0.03,
+            0.03,
+            label,
+            transform=ax.transAxes,
+            color='white',
+            fontproperties=self.cfg.font_prop,
+            ha='left',
+            va='bottom',
+            clip_on=True,
+        )
+
     def _scale_bar_geometry(self):
         margin = max(1.0, float(self.cfg.sb_margin))
         margin = min(margin, self.cfg.crop_w / 4.0, self.cfg.crop_h / 4.0)
@@ -962,6 +979,8 @@ class FigureBuilder:
             self._draw_title(ax, label)
             if i == 0:
                 self.add_scale_bar_patch(ax, log=log)
+                if getattr(self.cfg, 'condition_lbl', None):
+                    self._draw_condition_label(ax, self.cfg.condition_lbl)
 
             if key == overlay_target:
                 if item.get('zoom_coords') is not None:
@@ -996,6 +1015,8 @@ class FigureBuilder:
         ax.axis('off')
         self._draw_title(ax, label or self.cfg.lbl_merge)
         self.add_scale_bar_patch(ax, log=log)
+        if getattr(self.cfg, 'condition_lbl', None):
+            self._draw_condition_label(ax, self.cfg.condition_lbl)
 
         canvas.draw()
         rgba = np.asarray(canvas.buffer_rgba())
@@ -1109,6 +1130,9 @@ class FigureBuilder:
 
                 if r == 0 and ci == 0:
                     self.add_scale_bar_patch(ax, log=log)
+                    
+                if ci == 0 and getattr(self.cfg, 'condition_lbl', None):
+                    self._draw_condition_label(ax, self.cfg.condition_lbl)
 
                 if key == overlay_target:
                     if item.get('zoom_coords') is not None:
