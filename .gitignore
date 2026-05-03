@@ -38,6 +38,9 @@ env/
 *.sublime-workspace
 
 # Data & output (do not commit large image files)
+# Local microscopy export folders / scratch copies (adjust as needed)
+9G-m8/
+
 *.tif
 *.tiff
 *.png

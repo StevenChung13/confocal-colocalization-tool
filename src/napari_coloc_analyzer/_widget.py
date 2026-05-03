@@ -8,6 +8,7 @@ from the standalone ``coloc_analyzer.py``.
 import os
 import glob
 import json
+import datetime
 import traceback
 
 import napari
@@ -45,6 +46,11 @@ from napari_coloc_analyzer._core import (
     save_session_record,
     load_session_record,
     build_date_summary,
+)
+from napari_coloc_analyzer.cross_experiment_montage import (
+    build_custom_montage,
+    list_experiment_dirs,
+    ordered_image_basenames,
 )
 
 
@@ -86,8 +92,16 @@ class ColocWidget(QWidget):
         self.zoom_shapes_layer = None
         self.line_shapes_layer = None
 
+        self.ce_exp_dirs = []
+        self.ce_row_entries = []
+
         self._build_ui()
         self._load_settings()          # (E) Restore last-used settings
+        df = self.date_folder_edit.text().strip() or datetime.datetime.now().strftime("%Y%m%d")
+        self.ce_date_edit.setText(os.path.join(BASE_DIR, "Output_Coloc", df))
+        self._ce_add_selection_row()
+        self.ce_out_edit.setPlaceholderText(
+            self._ce_default_output_basename_for_date_leaf(df))
         self._bind_keyboard_shortcuts() # (D) Keyboard shortcuts
         self._set_state(_UNCONFIGURED)
         QTimer.singleShot(0, self._refresh_preview)
@@ -123,8 +137,7 @@ class ColocWidget(QWidget):
         row_date = QHBoxLayout()
         row_date.addWidget(QLabel("Date Folder:"))
         self.date_folder_edit = QLineEdit()
-        import datetime as _dt
-        self.date_folder_edit.setPlaceholderText(_dt.datetime.now().strftime("%Y%m%d"))
+        self.date_folder_edit.setPlaceholderText(datetime.datetime.now().strftime("%Y%m%d"))
         row_date.addWidget(self.date_folder_edit)
         sl.addLayout(row_date)
 
@@ -523,6 +536,115 @@ class ColocWidget(QWidget):
         layout.addWidget(grp_record)
         self.grp_record = grp_record
 
+        # Cross-experiment montage (uses finalized outputs under Output_Coloc/<date>/)
+        grp_ce = QGroupBox("Cross-experiment montage")
+        cel = QVBoxLayout()
+        row_ce_path = QHBoxLayout()
+        row_ce_path.addWidget(QLabel("Date folder:"))
+        self.ce_date_edit = QLineEdit()
+        self.ce_date_edit.setPlaceholderText(os.path.join(BASE_DIR, "Output_Coloc", "YYYYMMDD"))
+        row_ce_path.addWidget(self.ce_date_edit)
+        self.ce_browse_date_btn = QPushButton("Browse")
+        self.ce_browse_date_btn.clicked.connect(self._ce_browse_date_dir)
+        row_ce_path.addWidget(self.ce_browse_date_btn)
+        self.ce_refresh_btn = QPushButton("Scan experiments")
+        self.ce_refresh_btn.clicked.connect(self._ce_refresh_experiments)
+        row_ce_path.addWidget(self.ce_refresh_btn)
+        cel.addLayout(row_ce_path)
+
+        self.ce_rows_host = QWidget()
+        self.ce_rows_layout = QVBoxLayout(self.ce_rows_host)
+        self.ce_rows_layout.setContentsMargins(0, 0, 0, 0)
+        cel.addWidget(self.ce_rows_host)
+
+        row_ce_ar = QHBoxLayout()
+        self.ce_add_row_btn = QPushButton("Add row")
+        self.ce_add_row_btn.clicked.connect(self._ce_add_selection_row)
+        row_ce_ar.addWidget(self.ce_add_row_btn)
+        self.ce_remove_row_btn = QPushButton("Remove row")
+        self.ce_remove_row_btn.clicked.connect(self._ce_remove_selection_row)
+        row_ce_ar.addWidget(self.ce_remove_row_btn)
+        row_ce_ar.addStretch(1)
+        cel.addLayout(row_ce_ar)
+
+        row_ce_out = QHBoxLayout()
+        row_ce_out.addWidget(QLabel("Output base name:"))
+        self.ce_out_edit = QLineEdit()
+        row_ce_out.addWidget(self.ce_out_edit)
+        cel.addLayout(row_ce_out)
+
+        row_ce_gap = QHBoxLayout()
+        row_ce_gap.addWidget(QLabel("Vertical gap (px):"))
+        self.ce_gap_spin = QSpinBox()
+        self.ce_gap_spin.setRange(0, 200)
+        self.ce_gap_spin.setValue(20)
+        row_ce_gap.addWidget(self.ce_gap_spin)
+        row_ce_gap.addWidget(QLabel("Channel spacing (px):"))
+        self.ce_channel_spacing_spin = QSpinBox()
+        self.ce_channel_spacing_spin.setRange(0, 200)
+        self.ce_channel_spacing_spin.setValue(12)
+        self.ce_channel_spacing_spin.setToolTip(
+            "Spacing between subplot columns (labeled mode) converted from pixels vs "
+            "export DPI — or spacing between raw TIFF tiles when labels are off."
+        )
+        row_ce_gap.addWidget(self.ce_channel_spacing_spin)
+        row_ce_gap.addWidget(QLabel("Outer H margin (px):"))
+        self.ce_gap_horizontal_spin = QSpinBox()
+        self.ce_gap_horizontal_spin.setToolTip(
+            "Transparent margin on the left and right of the finished montage."
+        )
+        self.ce_gap_horizontal_spin.setRange(0, 500)
+        self.ce_gap_horizontal_spin.setValue(0)
+        row_ce_gap.addWidget(self.ce_gap_horizontal_spin)
+        row_ce_gap.addWidget(QLabel("DPI:"))
+        self.ce_dpi_spin = QSpinBox()
+        self.ce_dpi_spin.setRange(72, 1200)
+        self.ce_dpi_spin.setValue(300)
+        self.ce_dpi_spin.setToolTip(
+            "DPI embedded in the final assembled PNG/PDF. With labels on, each row is "
+            "drawn at that experiment's saved export DPI (same as Panel_View) so fonts "
+            "and stroke widths match the originals."
+        )
+        row_ce_gap.addWidget(self.ce_dpi_spin)
+        row_ce_gap.addStretch(1)
+        cel.addLayout(row_ce_gap)
+
+        self.ce_labeled_strip_check = QCheckBox(
+            "Include labels, scale bar, and overlays (matplotlib render)")
+        self.ce_labeled_strip_check.setChecked(True)
+        self.ce_labeled_strip_check.setToolTip(
+            "Re-draws each row like Panel_View PNG (titles, scale bar, condition label, "
+            "zoom ROI, profile line, intensity plot). Untick to paste raw 1_Cyan…6_BF "
+            "TIFFs only."
+        )
+        cel.addWidget(self.ce_labeled_strip_check)
+
+        row_ce_zoom = QHBoxLayout()
+        row_ce_zoom.addWidget(QLabel("Zoom ROI stroke (pt):"))
+        self.ce_zoom_roi_stroke_spin = QDoubleSpinBox()
+        self.ce_zoom_roi_stroke_spin.setRange(0.0, 20.0)
+        self.ce_zoom_roi_stroke_spin.setDecimals(2)
+        self.ce_zoom_roi_stroke_spin.setSingleStep(0.1)
+        self.ce_zoom_roi_stroke_spin.setValue(0.0)
+        self.ce_zoom_roi_stroke_spin.setToolTip(
+            "Dashed zoom-box line width in matplotlib points. Use 0 to match the "
+            "previous Panel_View export default exactly."
+        )
+        row_ce_zoom.addWidget(self.ce_zoom_roi_stroke_spin)
+        row_ce_zoom.addStretch(1)
+        cel.addLayout(row_ce_zoom)
+
+        self.ce_build_btn = QPushButton("Build custom montage")
+        self.ce_build_btn.setToolTip(
+            "Row index follows each experiment's summary montage (processed images only)."
+        )
+        self.ce_build_btn.clicked.connect(self._ce_build_montage)
+        cel.addWidget(self.ce_build_btn)
+
+        grp_ce.setLayout(cel)
+        layout.addWidget(grp_ce)
+        self.grp_ce_montage = grp_ce
+
         # === NEW EXPERIMENT (RESET) BUTTON ===
         self.reset_btn = QPushButton("\u21bb  NEW EXPERIMENT")
         self.reset_btn.setStyleSheet(
@@ -542,6 +664,7 @@ class ColocWidget(QWidget):
             (grp_nav,     False),
             (grp_log,     False),
             (grp_record,  True),
+            (grp_ce, True),
         ]:
             self._make_collapsible(grp, layout, collapsed)
 
@@ -745,6 +868,154 @@ class ColocWidget(QWidget):
             self.psf_path_edit.setText(path)
 
     # ----------------------------------------------------------------
+    #  Cross-experiment montage
+    # ----------------------------------------------------------------
+    @staticmethod
+    def _ce_default_output_basename_for_date_leaf(leaf):
+        return f"{leaf}_CUSTOM_MONTAGE"
+
+    def _ce_sync_ce_out_placeholder(self):
+        dd = self.ce_date_edit.text().strip()
+        if dd:
+            leaf = os.path.basename(dd.rstrip(os.sep))
+            self.ce_out_edit.setPlaceholderText(
+                self._ce_default_output_basename_for_date_leaf(leaf))
+
+    def _ce_browse_date_dir(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select output date folder", self.ce_date_edit.text() or BASE_DIR)
+        if folder:
+            self.ce_date_edit.setText(folder)
+            self._ce_sync_ce_out_placeholder()
+
+    def _ce_fill_combo(self, combo):
+        prev_path = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        sel_idx = 0
+        for i, exp_path in enumerate(self.ce_exp_dirs):
+            combo.addItem(os.path.basename(exp_path), exp_path)
+            if prev_path is not None and exp_path == prev_path:
+                sel_idx = i
+        combo.blockSignals(False)
+        if combo.count() > 0:
+            combo.setCurrentIndex(sel_idx)
+
+    def _ce_add_selection_row(self):
+        row_w = QWidget()
+        hb = QHBoxLayout(row_w)
+        hb.setContentsMargins(0, 3, 0, 3)
+        combo = QComboBox()
+        combo.setMinimumWidth(160)
+        spin = QSpinBox()
+        spin.setRange(1, 1)
+
+        hb.addWidget(QLabel("Experiment:"))
+        hb.addWidget(combo, stretch=1)
+        hb.addWidget(QLabel("Row (1-based):"))
+        hb.addWidget(spin)
+
+        def _upd_row(_idx=None):
+            path = combo.currentData()
+            if not path:
+                spin.setMaximum(1)
+                return
+            try:
+                n = len(ordered_image_basenames(path))
+            except Exception:
+                spin.setMaximum(1)
+                return
+            spin.setMaximum(max(1, n))
+            spin.setMinimum(1)
+            if spin.value() > spin.maximum():
+                spin.setValue(spin.maximum())
+
+        combo.currentIndexChanged.connect(_upd_row)
+        self.ce_rows_layout.addWidget(row_w)
+
+        entry = {'widget': row_w, 'combo': combo, 'spin': spin, '_upd': _upd_row}
+        self.ce_row_entries.append(entry)
+        self._ce_fill_combo(combo)
+        _upd_row()
+
+    def _ce_remove_selection_row(self):
+        if len(self.ce_row_entries) <= 1:
+            self._log("Cross-exp: keep at least one selection row.")
+            return
+        entry = self.ce_row_entries.pop()
+        self.ce_rows_layout.removeWidget(entry['widget'])
+        entry['widget'].deleteLater()
+
+    def _ce_refresh_experiments(self):
+        date_dir = self.ce_date_edit.text().strip()
+        if not date_dir:
+            date_dir = os.path.join(
+                BASE_DIR, "Output_Coloc",
+                self.date_folder_edit.text().strip() or datetime.datetime.now().strftime("%Y%m%d"))
+            self.ce_date_edit.setText(date_dir)
+        try:
+            self.ce_exp_dirs = list_experiment_dirs(date_dir)
+        except FileNotFoundError as e:
+            self._log(f"ERROR: {e}")
+            return
+        except OSError as e:
+            self._log(f"ERROR: {e}")
+            return
+
+        self._log(f"Cross-exp: scanned {len(self.ce_exp_dirs)} experiment folder(s).")
+        self._ce_sync_ce_out_placeholder()
+        if not self.ce_row_entries:
+            self._ce_add_selection_row()
+            return
+        for entry in self.ce_row_entries:
+            self._ce_fill_combo(entry['combo'])
+            entry['_upd']()
+
+    def _ce_build_montage(self):
+        date_dir = self.ce_date_edit.text().strip()
+        if not date_dir or not os.path.isdir(date_dir):
+            self._log("Cross-exp ERROR: choose a valid output date folder first.")
+            return
+        selections = []
+        for entry in self.ce_row_entries:
+            p = entry['combo'].currentData()
+            if p:
+                selections.append((p, entry['spin'].value()))
+        if not selections:
+            self._log("Cross-exp ERROR: scan experiments and pick at least one row.")
+            return
+        out_name = self.ce_out_edit.text().strip()
+        if not out_name:
+            out_name = self._ce_default_output_basename_for_date_leaf(
+                os.path.basename(date_dir.rstrip(os.sep)))
+        out_base = os.path.join(date_dir, out_name.rstrip(os.sep))
+
+        gap = max(self.ce_gap_spin.value(), 0)
+        gap_h = max(self.ce_gap_horizontal_spin.value(), 0)
+        ch_sp = max(self.ce_channel_spacing_spin.value(), 0)
+        dpi = self.ce_dpi_spin.value()
+        labeled = self.ce_labeled_strip_check.isChecked()
+        zoom_stroke = max(self.ce_zoom_roi_stroke_spin.value(), 0.0)
+
+        try:
+            build_custom_montage(
+                selections,
+                out_base,
+                gap_px=gap,
+                gap_horizontal_px=gap_h,
+                channel_spacing_px=ch_sp,
+                labeled_strip=labeled,
+                zoom_roi_stroke_pt=zoom_stroke,
+                dpi=dpi,
+                log=self._log,
+            )
+        except (FileNotFoundError, ValueError) as e:
+            self._log(f"Cross-exp ERROR: {e}")
+        except Exception as e:
+            self._log(f"Cross-exp ERROR: {e}")
+            self._log(traceback.format_exc())
+
+    # ----------------------------------------------------------------
     #  LOAD EXPERIMENT
     # ----------------------------------------------------------------
     def _on_load_experiment(self):
@@ -830,6 +1101,9 @@ class ColocWidget(QWidget):
             wavelength_nm=self.wavelength_spin.value(),
         )
         self.fig_builder = FigureBuilder(self.cfg)
+
+        self.ce_date_edit.setText(self.cfg.date_dir)
+        self._ce_sync_ce_out_placeholder()
 
         self.experiments = experiments
 
@@ -1501,6 +1775,9 @@ class ColocWidget(QWidget):
         self.gallery = gallery
         self.stats_log = stats_log
         self.fig_builder = FigureBuilder(cfg)
+
+        self.ce_date_edit.setText(cfg.date_dir)
+        self._ce_sync_ce_out_placeholder()
 
         self.date_folder_edit.setText(getattr(cfg, 'date_folder', ''))
         self.exp_name_edit.setText(cfg.exp_name)

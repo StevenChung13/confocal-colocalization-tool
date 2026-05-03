@@ -22,6 +22,7 @@ Built on [Napari](https://napari.org/), it lets you visually select regions of i
 | **Date folder organisation** | Group experiments by date (`YYYYMMDD`) for cleaner project structure |
 | **Session record (pickle)** | Save your entire session (settings + processed data) to a `.pkl` file; reload later to change labels, font, layout — no reprocessing needed |
 | **Mega-montage** | Automatically combines all experiment montages from a date folder into a single two-column overview (PNG + PDF) |
+| **Cross-experiment montage** | Stack **one montage row per experiment** under a shared date folder (by gallery order); optional matplotlib re-render to match **Panel_View** (labels, scale bar, dashed ROI, profile line, intensity plot); writes PNG, PDF, and a JSON **`_spec`**; optional ROI stroke-width override (**pt**) |
 | **Shape layer safety** | Automatic vertex-count sanitiser prevents accidental cross-layer drawing |
 | **CSV export** | Colocalization statistics and intensity profiles saved per image |
 
@@ -100,7 +101,10 @@ Confocal_Workflow/
         │   ├── <Experiment>_QUANTIFICATION.csv
         │   └── <Experiment>_session_record.pkl
         ├── <DateFolder>_MEGA_SUMMARY.png    ← all experiments combined
-        └── <DateFolder>_MEGA_SUMMARY.pdf
+        ├── <DateFolder>_MEGA_SUMMARY.pdf
+        ├── <basename>_CUSTOM_MONTAGE.png  ← optional cross-experiment stack
+        ├── <basename>_CUSTOM_MONTAGE.pdf
+        └── <basename>_CUSTOM_MONTAGE_spec.json
 ```
 
 ---
@@ -221,9 +225,9 @@ This is the key time-saving feature. If you need to change included channels, ch
 
 ```bash
 python coloc_analyzer.py
-# Choose:  New session [n] / Replay from record [r]
-# Press 'r', then paste the path to your .pkl file
-# Follow the prompts to edit labels, font, DPI, etc.
+# Choose:  New session [n] / Replay [r] / Cross-exp montage [c]
+# 'r': paste path to `.pkl`, then prompts to regenerate outputs
+# 'c': stack one montage row per experiment under an Output_Coloc date folder
 ```
 
 ---
@@ -254,6 +258,31 @@ After finalization, all `*_SUMMARY_MONTAGE.png` files in the date folder are aut
 - Saved as both PNG (with transparent background) and PDF
 
 This gives you a single overview of all experiments done on that date.
+
+---
+
+## Cross-experiment montage
+
+After several experiments share a **date folder** under `Output_Coloc/`, you can build a **single vertical montage** with **one row per experiment**, chosen by **row index** in each experiment’s summary gallery (the same order as `*_SUMMARY_MONTAGE` and `*_session_record.pkl`). Use this when comparing conditions side-by-side in one figure strip.
+
+### In the Napari widget
+
+Under **Cross-experiment montage**:
+
+1. Enter the **Output_Coloc** date folder (e.g. `20260312`) and click **Scan experiments**.
+2. For each experiment, pick **which gallery row** to include (`1`-based vs the montage row order).
+3. Set **Vertical gap**, **Channel spacing**, **Outer H margin**, and assembled **DPI** (metadata on the exported PNG/PDF).
+4. **Include labels … (matplotlib)** — when checked, each row is re-drawn to match **`Panel_View`** (typography, scale bar, condition label, dashed zoom ROI on the overlay column, profile line, intensity plot). Uncheck to paste raw `1_Cyan.tif` … `6_BF.tif` tiles only (with spacing).
+5. **Zoom ROI stroke (pt)** — dashed box line width in matplotlib **points**. Use **`0`** for the exact same stroke as the original **`Panel_View`** export; increase only if you need a visibly thicker dashed outline.
+6. Click **Build custom montage**. Outputs land in that date folder: `<basename>.png`, `<basename>.pdf`, and `<basename>_spec.json` (build parameters plus per-row sources).
+
+### Standalone CLI (`coloc_analyzer.py`)
+
+```bash
+python coloc_analyzer.py
+```
+
+At the startup prompt choose **Cross-exp montage `[c]`** and follow the prompts (experiment `index:row` pairs, spacing, DPI, ROI stroke).
 
 ---
 
@@ -290,6 +319,8 @@ Notes:
 |---|---|
 | `*_MEGA_SUMMARY.png` | Two-column overview of all experiment montages (transparent background) |
 | `*_MEGA_SUMMARY.pdf` | Same mega-montage in PDF format |
+| `<basename>_CUSTOM_MONTAGE.png/pdf` | Optional cross-experiment stack (see **Cross-experiment montage** above) |
+| `<basename>_CUSTOM_MONTAGE_spec.json` | JSON log of selections, spacing, labeled mode, DPI, and ROI stroke override |
 
 ---
 

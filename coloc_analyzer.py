@@ -48,6 +48,7 @@ except ImportError:
     )
     exit(1)
 import pickle
+import sys
 import math
 from PIL import Image
 import pandas as pd
@@ -61,6 +62,7 @@ from skimage.measure import profile_line
 from scipy.stats import pearsonr
 import datetime
 import warnings
+import traceback
 
 # ================================================================
 #  DEFAULT BASE DIRECTORY
@@ -1296,12 +1298,129 @@ def replay_session():
 
 
 # ================================================================
+#  Cross-experiment custom montage (CLI)
+# ================================================================
+def interactive_cross_experiment_montage():
+    """Pick one montage row per experiment under a date folder; write stacked PNG/PDF."""
+    try:
+        from napari_coloc_analyzer.cross_experiment_montage import (
+            build_custom_montage,
+            list_experiment_dirs,
+        )
+    except ImportError:
+        root = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(root, "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from napari_coloc_analyzer.cross_experiment_montage import (
+            build_custom_montage,
+            list_experiment_dirs,
+        )
+
+    print("\n--- CROSS-EXPERIMENT CUSTOM MONTAGE ---")
+    today = datetime.datetime.now().strftime("%Y%m%d")
+    default_dd = os.path.join(BASE_DIR, "Output_Coloc", today)
+    date_dir = get_user_input(
+        "Path to Output_Coloc date folder", default_dd
+    ).replace("'", "").replace('"', "").strip()
+    if not os.path.isdir(date_dir):
+        print(f"ERROR: Folder not found: {date_dir}")
+        return
+
+    try:
+        exp_dirs = list_experiment_dirs(date_dir)
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        return
+
+    if not exp_dirs:
+        print(f"No finalized experiments (*_session_record.pkl) under:\n  {date_dir}")
+        return
+
+    print(f"\nFound {len(exp_dirs)} experiment(s):")
+    for i, p in enumerate(exp_dirs, start=1):
+        print(f"  [{i}] {os.path.basename(p)}")
+
+    raw_sel = get_user_input(
+        "Selections: exp:row pairs (spaces/commas, row is 1-based vs summary montage). "
+        "Example: 1:2 3:3",
+        "",
+    ).strip()
+    tokens = [t.strip() for t in re.split(r"[,;\s]+", raw_sel) if t.strip()]
+    selections = []
+
+    def _abort(msg):
+        print(f"ERROR: {msg}")
+
+    for tok in tokens:
+        if ":" not in tok:
+            _abort(f"token '{tok}' — use EXPERIMENT_INDEX:ROW, e.g. 2:1")
+            return
+        lhs, rhs = tok.split(":", 1)
+        try:
+            exp_i = int(lhs.strip())
+            row_1 = int(rhs.strip())
+        except ValueError:
+            _abort(f"non-integer indices in '{tok}'")
+            return
+        if exp_i < 1 or exp_i > len(exp_dirs):
+            _abort(
+                f"experiment index {exp_i} — must be between 1 and {len(exp_dirs)}"
+            )
+            return
+        selections.append((exp_dirs[exp_i - 1], row_1))
+
+    if not selections:
+        print("Nothing to combine (no selections).")
+        return
+
+    leaf = os.path.basename(date_dir.rstrip(os.sep))
+    default_base = f"{leaf}_CUSTOM_MONTAGE"
+
+    basename = get_user_input("Output basename (no extension)", default_base)
+    basename = basename.replace("'", "").replace('"', "").strip() or default_base
+
+    gap_px = int(get_user_input("Vertical gap between experiment rows (px)", "20"))
+    gap_horizontal_px = int(get_user_input("Outer left/right margin on montage (px)", "0"))
+    labeled = get_user_input(
+        "Include labels / scale bar / overlays (matplotlib) [y/n]", "y"
+    ).strip().lower().startswith("y")
+    ch_sp = int(get_user_input("Channel column spacing (pixels at export DPI)", "12"))
+    dpi = int(get_user_input("Raster DPI", "300"))
+    zoom_stroke = float(
+        get_user_input(
+            "Zoom ROI stroke width in pt (0 = same as Panel_View export)", "0"
+        ))
+
+    out_base = os.path.join(date_dir, basename)
+
+    print(f"\nWriting to {out_base}.png / .pdf ...")
+    try:
+        build_custom_montage(
+            selections, out_base,
+            gap_px=gap_px,
+            gap_horizontal_px=gap_horizontal_px,
+            channel_spacing_px=ch_sp,
+            labeled_strip=labeled,
+            zoom_roi_stroke_pt=zoom_stroke,
+            dpi=dpi, save_spec=True, log=print,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}")
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+        traceback.print_exc()
+
+
+# ================================================================
 #  ENTRY POINT
 # ================================================================
 if __name__ == "__main__":
     choice = get_user_input(
-        "\nNew session [n] / Replay from record [r]", "n").lower()
+        "\nNew session [n] / Replay [r] / Cross-exp montage [c]", "n").lower()
     if choice == 'r':
         replay_session()
+    elif choice == 'c':
+        interactive_cross_experiment_montage()
     else:
         ColocManager()

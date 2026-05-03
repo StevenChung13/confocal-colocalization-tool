@@ -10,6 +10,7 @@ it can be tested in isolation and driven from any front-end.
 
 import os
 import glob
+import io
 import datetime
 import re
 import warnings
@@ -745,8 +746,37 @@ class FigureBuilder:
     """Groups all matplotlib output methods.  Depends only on a
     :class:`SessionConfig` instance — no Qt or Napari references."""
 
+    # Point widths for zoom-box + profile line on Panel_View (must match PNG export)
+    _PANEL_VIEW_ZOOM_RECT_LW = 1.0
+    _PANEL_VIEW_PROFILE_LINE_LW = 0.8
+    _PANEL_VIEW_INTENSITY_AXIS_LW = 0.8
+
     def __init__(self, cfg):
         self.cfg = cfg
+
+    def _add_panel_view_roi_overlays(self, ax, key, overlay_target, item,
+                                    zoom_rect_linewidth_pt=None):
+        """Dashed zoom ROI box and profile line — same weights as ``Panel_View``."""
+        if key != overlay_target:
+            return
+        zoom_lw = self._PANEL_VIEW_ZOOM_RECT_LW
+        if zoom_rect_linewidth_pt is not None and float(zoom_rect_linewidth_pt) > 0:
+            zoom_lw = float(zoom_rect_linewidth_pt)
+        if item.get('zoom_coords') is not None:
+            side = int(self.cfg.zoom_size)
+            if side > 0:
+                ry, rx = item['zoom_coords']
+                rect = patches.Rectangle(
+                    (rx, ry), side, side,
+                    linewidth=zoom_lw, edgecolor='white',
+                    facecolor='none', linestyle='--', zorder=10)
+                ax.add_patch(rect)
+        if item.get('line_coords') is not None:
+            (ly0, lx0), (ly1, lx1) = item['line_coords']
+            ax.plot(
+                [lx0, lx1], [ly0, ly1],
+                color='white', linewidth=self._PANEL_VIEW_PROFILE_LINE_LW,
+                linestyle='--', zorder=10)
 
     # ----- layout helpers -----
     def _col_widths_inch(self, col_labels):
@@ -758,11 +788,13 @@ class FigureBuilder:
                 widths.append(self.cfg.panel_w_inch)
         return widths
 
-    def _make_axes_grid(self, fig, n_rows, n_cols, col_w, total_w, total_h):
+    def _make_axes_grid(self, fig, n_rows, n_cols, col_w, total_w, total_h,
+                        axis_spacing_inch=None):
         row_h = self.cfg.panel_h_inch
+        sp = axis_spacing_inch if axis_spacing_inch is not None else self.cfg.spacing_inch
         axes = []
         for r in range(n_rows):
-            row_top = r * (row_h + self.cfg.spacing_inch)
+            row_top = r * (row_h + sp)
             bottom = 1.0 - (row_top + row_h) / total_h
             h_frac = row_h / total_h
 
@@ -773,7 +805,7 @@ class FigureBuilder:
                 w_frac = col_w[ci] / total_w
                 ax = fig.add_axes([left, bottom, w_frac, h_frac])
                 row_axes.append(ax)
-                x += col_w[ci] + self.cfg.spacing_inch
+                x += col_w[ci] + sp
             axes.append(row_axes)
         return axes
 
@@ -956,11 +988,13 @@ class FigureBuilder:
         col_labels = [lbl for _, _, lbl in plot_list]
         col_w = self._col_widths_inch(col_labels)
 
-        total_w = sum(col_w) + (n_cols - 1) * self.cfg.spacing_inch
+        sp = self.cfg.spacing_inch
+        total_w = sum(col_w) + (n_cols - 1) * sp
         total_h = self.cfg.panel_h_inch
 
         fig = plt.figure(figsize=(total_w, total_h))
-        axes_grid = self._make_axes_grid(fig, 1, n_cols, col_w, total_w, total_h)
+        axes_grid = self._make_axes_grid(
+            fig, 1, n_cols, col_w, total_w, total_h, axis_spacing_inch=sp)
         axes = axes_grid[0]
 
         for i, ax in enumerate(axes):
@@ -971,10 +1005,11 @@ class FigureBuilder:
                     ax,
                     item.get('intensity_data'),
                     mode=item.get('mode', 'DUAL'),
-                                            linewidth=0.8, tick_scale=1.0)
+                    linewidth=self._PANEL_VIEW_INTENSITY_AXIS_LW,
+                    tick_scale=1.0)
                 continue
 
-            ax.imshow(img_data, aspect='auto', interpolation='none')
+            ax.imshow(img_data, aspect='auto', interpolation='none', zorder=0)
             ax.axis('off')
             self._draw_title(ax, label)
             if i == 0:
@@ -982,21 +1017,87 @@ class FigureBuilder:
                 if getattr(self.cfg, 'condition_lbl', None):
                     self._draw_condition_label(ax, self.cfg.condition_lbl)
 
-            if key == overlay_target:
-                if item.get('zoom_coords') is not None:
-                    ry, rx = item['zoom_coords']
-                    ax.add_patch(patches.Rectangle(
-                        (rx, ry), self.cfg.zoom_size, self.cfg.zoom_size,
-                        linewidth=1, edgecolor='white',
-                        facecolor='none', linestyle='--'))
-                if item.get('line_coords') is not None:
-                    (ly0, lx0), (ly1, lx1) = item['line_coords']
-                    ax.plot([lx0, lx1], [ly0, ly1],
-                            color='white', linewidth=0.8, linestyle='--')
+            self._add_panel_view_roi_overlays(ax, key, overlay_target, item)
 
+        fig.canvas.draw()
         plt.savefig(os.path.join(save_path, "Panel_View.pdf"), dpi=self.cfg.dpi)
         plt.savefig(os.path.join(save_path, "Panel_View.png"), dpi=self.cfg.dpi)
         plt.close(fig)
+
+    def render_panel_row_pil(self, item,
+                             axis_spacing_inch=None,
+                             output_dpi=None,
+                             zoom_roi_stroke_pt=None,
+                             log=print):
+        """Same subplot layout / typography / stroke weights as ``Panel_View`` PNG.
+
+        Rasterization uses ``self.cfg.dpi`` (the export DPI from the session that
+        wrote ``Panel_View.png``) unless *output_dpi* is set — changing DPI will
+        rescale font sizes and line widths vs the originals.
+
+        Positive *zoom_roi_stroke_pt* overrides the dashed zoom ROI stroke width
+        in matplotlib points; otherwise the same linewidth as ``Panel_View`` is
+        used. The ROI square side always comes from the session ``cfg.zoom_size``.
+        """
+        plot_list = list(self._iter_panel_items(item))
+        if not plot_list:
+            return None
+
+        dpi_use = (
+            float(output_dpi)
+            if output_dpi is not None
+            else float(self.cfg.dpi))
+        sp = (
+            axis_spacing_inch if axis_spacing_inch is not None
+            else self.cfg.spacing_inch)
+
+        overlay_target = next(
+            (k for k, _, _ in plot_list if k == 'merge'), plot_list[0][0])
+
+        n_cols = len(plot_list)
+        col_labels = [lbl for _, _, lbl in plot_list]
+        col_w = self._col_widths_inch(col_labels)
+
+        total_w = sum(col_w) + (n_cols - 1) * sp
+        total_h = self.cfg.panel_h_inch
+
+        fig = plt.figure(figsize=(total_w, total_h))
+        axes_grid = self._make_axes_grid(
+            fig, 1, n_cols, col_w, total_w, total_h, axis_spacing_inch=sp)
+        axes = axes_grid[0]
+
+        for i, ax in enumerate(axes):
+            key, img_data, label = plot_list[i]
+
+            if label == '__intensity__':
+                self._render_intensity_axes(
+                    ax,
+                    item.get('intensity_data'),
+                    mode=item.get('mode', 'DUAL'),
+                    linewidth=self._PANEL_VIEW_INTENSITY_AXIS_LW,
+                    tick_scale=1.0)
+                continue
+
+            ax.imshow(img_data, aspect='auto', interpolation='none', zorder=0)
+            ax.axis('off')
+            self._draw_title(ax, label)
+            if i == 0:
+                self.add_scale_bar_patch(ax, log=log)
+                if getattr(self.cfg, 'condition_lbl', None):
+                    self._draw_condition_label(ax, self.cfg.condition_lbl)
+
+            self._add_panel_view_roi_overlays(
+                ax, key, overlay_target, item,
+                zoom_rect_linewidth_pt=zoom_roi_stroke_pt)
+
+        fig.canvas.draw()
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=dpi_use)
+        plt.close(fig)
+        buf.seek(0)
+        pil_img = Image.open(buf).convert('RGBA').copy()
+        buf.close()
+        return pil_img
 
     def render_preview_panel(self, image_rgb=None, label=None, log=None):
         if image_rgb is None:
@@ -1124,7 +1225,7 @@ class FigureBuilder:
                     )
                     continue
 
-                ax.imshow(img_data, aspect='auto', interpolation='none')
+                ax.imshow(img_data, aspect='auto', interpolation='none', zorder=0)
                 ax.axis('off')
                 self._draw_title(ax, label)
 
@@ -1137,14 +1238,17 @@ class FigureBuilder:
                 if key == overlay_target:
                     if item.get('zoom_coords') is not None:
                         ry, rx = item['zoom_coords']
-                        ax.add_patch(patches.Rectangle(
+                        rect = patches.Rectangle(
                             (rx, ry), self.cfg.zoom_size, self.cfg.zoom_size,
                             linewidth=0.5, edgecolor='white',
-                            facecolor='none', linestyle='--'))
+                            facecolor='none', linestyle='--', zorder=10)
+                        ax.add_patch(rect)
                     if item.get('line_coords') is not None:
                         (ly0, lx0), (ly1, lx1) = item['line_coords']
-                        ax.plot([lx0, lx1], [ly0, ly1],
-                                color='white', linewidth=0.5, linestyle='--')
+                        ax.plot(
+                            [lx0, lx1], [ly0, ly1],
+                            color='white', linewidth=0.5, linestyle='--',
+                            zorder=10, solid_capstyle='round')
 
         base_name = os.path.join(self.cfg.output_dir,
                                  f"{self.cfg.exp_name}_SUMMARY_MONTAGE")
